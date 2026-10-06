@@ -1,0 +1,18 @@
+#version 450
+
+layout(location = 0) in vec2 inPosition;
+layout(location = 1) in vec4 inColor;
+layout(location = 0) out vec4 fragColor;
+
+layout(push_constant) uniform View {
+    vec2 pan;
+    float zoom;
+    float aspect;
+} view;
+
+void main() {
+    vec2 position = (inPosition + view.pan) * view.zoom;
+    position.x /= view.aspect;
+    gl_Position = vec4(position, 0.0, 1.0);
+    fragColor = inColor;
+}
