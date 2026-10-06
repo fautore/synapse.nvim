@@ -14,7 +14,8 @@ Note :: struct {
 	title: string,
 	pos:   Vec2,
 	vel:   Vec2,
-	links: [dynamic]string,
+	links:  [dynamic]string,
+	exists: bool,
 }
 
 Edge :: struct { from, to: int }
@@ -137,6 +138,7 @@ load_graph :: proc(root: string) -> (Graph, bool) {
 			title = note_title(content, info.fullpath),
 			pos = {math.cos(angle) * radius, math.sin(angle) * radius},
 			links = extract_links(content),
+			exists = true,
 		}
 		append(&graph.notes, note)
 		delete(data)
@@ -156,14 +158,31 @@ load_graph :: proc(root: string) -> (Graph, bool) {
 		if _, exists := by_name[name]; exists { ambiguous[name] = true } else { by_name[name] = i }
 	}
 	seen := make(map[u64]bool)
-	for note, from in graph.notes {
+	real_note_count := len(graph.notes)
+	for from in 0..<real_note_count {
+		note := graph.notes[from]
 		for target in note.links {
 			to, found := by_id[target]
 			if !found {
 				name := filepath.base(target)
 				if !ambiguous[name] { to, found = by_name[name] }
 			}
-			if !found || to == from { continue }
+			if !found {
+				// Obsidian displays unresolved wiki links as dim placeholder nodes.
+				h := hash_string(target)
+				angle := f32(h % 10000) / 10000.0 * 2.0 * math.PI
+				radius := 0.15 + f32((h >> 14) % 1000) / 1000.0 * 0.65
+				to = len(graph.notes)
+				append(&graph.notes, Note{
+					id = strings.clone(target),
+					title = strings.clone(filepath.base(target)),
+					pos = {math.cos(angle) * radius, math.sin(angle) * radius},
+					exists = false,
+				})
+				by_id[graph.notes[to].id] = to
+				found = true
+			}
+			if to == from { continue }
 			a, b := from, to
 			if a > b { a, b = b, a }
 			key := (u64(u32(a)) << 32) | u64(u32(b))

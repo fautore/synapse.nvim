@@ -3,11 +3,14 @@
 A Neovim extension that scans the repository containing the current buffer and opens its Markdown notes as an Obsidian-style knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).
 
 - `[[wiki links]]`, aliases, headings, and Markdown links to `.md` files
-- force-directed layout and degree-based node sizing
-- current-buffer node highlighted in amber
+- force-directed layout with connection-weighted node sizing
+- unresolved links rendered as dim ghost nodes and connectors
+- antialiased node and connector edges
+- current-buffer node highlighted with the configured accent
 - live in-window graph reload for Markdown changes, including changes made outside Neovim
 - colors inherited from Neovim and updated live on `:colorscheme` changes
-- hover a node to show its title and repository-relative path
+- terminal font detection for Kitty and Ghostty, with Fontconfig fallback
+- hover focus enlarges the node, highlights its neighbors/links, and labels it directly below the node
 - GPU rendering through Vulkan; GLFW is used only for the native window/input
 - repository detection via `.obsidian`, `.git`, or `.jj`
 
@@ -19,6 +22,7 @@ A Neovim extension that scans the repository containing the current buffer and o
 - [Odin](https://odin-lang.org/docs/install/)
 - Vulkan loader and a Vulkan-capable driver
 - GLFW 3 development/runtime library
+- FreeType 2 development library, `pkg-config`, and a C compiler
 - `glslc` from the Vulkan SDK (needed when building)
 
 Odin's bundled `vendor:glfw` and `vendor:vulkan` bindings are used; no extra Odin packages are needed.
@@ -74,13 +78,18 @@ require("synapse").setup({
   auto_build = true,
   odin = "odin",
   glslc = "glslc",
+  -- Usually detected from Kitty/Ghostty automatically:
+  -- font = "0xProto Nerd Font", -- family name or a .ttf/.otf path
+  -- font_size = 14,
   root_markers = { ".obsidian", ".git", ".jj" },
   highlight_groups = {
     background = "Normal",       -- background color
+    foreground = "Normal",       -- hover label
     node = "Function",           -- connected notes
     edge = "Comment",            -- links
     muted = "NonText",           -- unlinked notes
     current = "DiagnosticWarn",  -- current-buffer note
+    ghost = "LineNr",            -- unresolved links
   },
   -- root = "/fixed/vault", -- string or function(start_path) -> root
   -- executable = vim.fn.stdpath("data") .. "/synapse/synapse",

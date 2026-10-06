@@ -14,6 +14,7 @@ import "core:math"
 import "core:mem"
 import "core:os"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "core:time"
 
@@ -49,7 +50,8 @@ g_vertex_buffer: vk.Buffer
 g_vertex_memory: vk.DeviceMemory
 g_zoom: f32 = 1.0
 g_pan := Vec2{}
-g_last_hovered := -2
+g_last_hovered := -1
+g_degrees: []int
 g_root: string
 g_current: string
 g_vault_fingerprint: u64
@@ -57,14 +59,51 @@ g_next_vault_scan: f64
 g_theme_file: string
 g_next_theme_scan: f64
 g_background := [4]f32{0.025, 0.035, 0.055, 1.0}
+g_text_color := [4]f32{0.75, 0.78, 0.84, 1.0}
 g_node_color := [4]f32{0.30, 0.68, 0.96, 1.0}
 g_edge_color := [4]f32{0.35, 0.48, 0.68, 0.42}
 g_muted_color := [4]f32{0.43, 0.48, 0.58, 1.0}
 g_highlight_color := [4]f32{1.0, 0.70, 0.22, 1.0}
+g_ghost_color := [4]f32{0.20, 0.22, 0.25, 0.82}
+g_font_path: string
+g_font_point_size: f32 = 10
+g_font_pixel_height: f32
+g_font_ascent: f32
+g_font_bitmap: []byte
+g_font_chars: [224]Font_Glyph
+g_font_ready: bool
+
+Font_Glyph :: struct {
+	x, y:               i32,
+	width, height:      i32,
+	bearing_x, bearing_y: i32,
+	advance:            f32,
+}
+
+@(require, extra_linker_flags="-lfreetype")
+foreign import font_bridge "../target/libfont_bridge.a"
+
+foreign font_bridge {
+	synapse_bake_font :: proc "c" (
+		path: cstring,
+		pixel_height: f32,
+		atlas: [^]byte,
+		atlas_width, atlas_height: i32,
+		first_codepoint, codepoint_count: i32,
+		glyphs: [^]Font_Glyph,
+		ascent: ^f32,
+	) -> i32 ---
+}
+
+FONT_FIRST :: 32
+FONT_LAST :: 255
+FONT_ATLAS_WIDTH :: 1024
+FONT_ATLAS_HEIGHT :: 512
 
 Vertex :: struct {
 	x, y:       f32,
 	r, g, b, a: f32,
+	screen:      f32,
 }
 
 Push_Constants :: struct {
@@ -112,12 +151,13 @@ main :: proc() {
 	context.logger = log.create_console_logger()
 	g_ctx = context
 
-	g_root, g_current, g_theme_file = parse_arguments()
+	g_root, g_current, g_theme_file, g_font_path, g_font_point_size = parse_arguments()
 	load_theme(g_theme_file)
 	ok: bool
 	g_graph, ok = load_graph(g_root)
 	if !ok { log.panicf("could not scan vault %q", g_root) }
 	layout_graph(&g_graph)
+	rebuild_degrees()
 	g_vertices = build_mesh(&g_graph, g_current)
 	g_vault_fingerprint = vault_fingerprint(g_root)
 	log.infof("synapse: loaded %d notes and %d links", len(g_graph.notes), len(g_graph.edges))
@@ -142,6 +182,8 @@ main :: proc() {
 	delete(c_title)
 	if g_window == nil { log.panic("glfw: could not create a Vulkan window") }
 	defer glfw.DestroyWindow(g_window)
+	_, content_scale := glfw.GetWindowContentScale(g_window)
+	load_font(g_font_path, g_font_point_size * 96.0 / 72.0 * content_scale)
 	glfw.SetScrollCallback(g_window, scroll_callback)
 
 	glfw.SetFramebufferSizeCallback(g_window, proc "c" (_: glfw.WindowHandle, _, _: i32) {
@@ -350,15 +392,16 @@ main :: proc() {
 			stride = size_of(Vertex),
 			inputRate = .VERTEX,
 		}
-		attributes := [2]vk.VertexInputAttributeDescription {
+		attributes := [3]vk.VertexInputAttributeDescription {
 			{location = 0, binding = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, x))},
 			{location = 1, binding = 0, format = .R32G32B32A32_SFLOAT, offset = u32(offset_of(Vertex, r))},
+			{location = 2, binding = 0, format = .R32_SFLOAT, offset = u32(offset_of(Vertex, screen))},
 		}
 		vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
 			sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 			vertexBindingDescriptionCount = 1,
 			pVertexBindingDescriptions = &binding,
-			vertexAttributeDescriptionCount = 2,
+			vertexAttributeDescriptionCount = 3,
 			pVertexAttributeDescriptions = &attributes[0],
 		}
 
@@ -981,7 +1024,8 @@ record_command_buffer :: proc(command_buffer: vk.CommandBuffer, image_index: u32
 	must(vk.EndCommandBuffer(command_buffer))
 }
 
-parse_arguments :: proc() -> (root, current, theme_file: string) {
+parse_arguments :: proc() -> (root, current, theme_file, font_path: string, font_size: f32) {
+	font_size = 10
 	root = "."
 	for i := 1; i < len(os.args); i += 1 {
 		switch os.args[i] {
@@ -991,6 +1035,13 @@ parse_arguments :: proc() -> (root, current, theme_file: string) {
 			if i+1 < len(os.args) { i += 1; current = normalize_id(os.args[i]) }
 		case "--theme-file":
 			if i+1 < len(os.args) { i += 1; theme_file = os.args[i] }
+		case "--font":
+			if i+1 < len(os.args) { i += 1; font_path = os.args[i] }
+		case "--font-size":
+			if i+1 < len(os.args) {
+				i += 1
+				if parsed, parsed_ok := strconv.parse_f32(os.args[i]); parsed_ok { font_size = parsed }
+			}
 		case:
 			// A positional path is convenient when running the renderer by hand.
 			if i == 1 { root = os.args[i] }
@@ -999,50 +1050,287 @@ parse_arguments :: proc() -> (root, current, theme_file: string) {
 	return
 }
 
-append_triangle :: proc(vertices: ^[dynamic]Vertex, a, b, c: Vec2, color: [4]f32) {
-	append(vertices,
-		Vertex{a.x, a.y, color[0], color[1], color[2], color[3]},
-		Vertex{b.x, b.y, color[0], color[1], color[2], color[3]},
-		Vertex{c.x, c.y, color[0], color[1], color[2], color[3]},
+vertex :: proc(point: Vec2, color: [4]f32, screen: f32 = 0) -> Vertex {
+	return Vertex{point.x, point.y, color[0], color[1], color[2], color[3], screen}
+}
+
+append_colored_triangle :: proc(vertices: ^[dynamic]Vertex, a, b, c: Vertex) {
+	append(vertices, a, b, c)
+}
+
+append_triangle :: proc(vertices: ^[dynamic]Vertex, a, b, c: Vec2, color: [4]f32, screen: f32 = 0) {
+	append_colored_triangle(vertices, vertex(a, color, screen), vertex(b, color, screen), vertex(c, color, screen))
+}
+
+with_alpha :: proc(color: [4]f32, alpha: f32) -> [4]f32 {
+	result := color
+	result[3] *= alpha
+	return result
+}
+
+mix_color :: proc(a, b: [4]f32, amount: f32) -> [4]f32 {
+	return {
+		a[0] + (b[0]-a[0])*amount,
+		a[1] + (b[1]-a[1])*amount,
+		a[2] + (b[2]-a[2])*amount,
+		a[3] + (b[3]-a[3])*amount,
+	}
+}
+
+node_radius :: proc(degree: int) -> f32 {
+	return min(0.012 + math.sqrt(f32(max(degree, 0))) * 0.0055, 0.052)
+}
+
+rebuild_degrees :: proc() {
+	delete(g_degrees)
+	g_degrees = make([]int, len(g_graph.notes))
+	for edge in g_graph.edges {
+		g_degrees[edge.from] += 1
+		g_degrees[edge.to] += 1
+	}
+}
+
+append_antialiased_link :: proc(
+	vertices: ^[dynamic]Vertex,
+	a, b: Vec2,
+	color: [4]f32,
+	width: f32,
+) {
+	dx, dy := b.x-a.x, b.y-a.y
+	length := math.sqrt(dx*dx + dy*dy)
+	if length < 0.0001 { return }
+	feather: f32 = 0.0018
+	inner := Vec2{-dy/length*width, dx/length*width}
+	outer := Vec2{-dy/length*(width+feather), dx/length*(width+feather)}
+	ai, bi := Vec2{a.x+inner.x,a.y+inner.y}, Vec2{b.x+inner.x,b.y+inner.y}
+	ci, di := Vec2{a.x-inner.x,a.y-inner.y}, Vec2{b.x-inner.x,b.y-inner.y}
+	ao, bo := Vec2{a.x+outer.x,a.y+outer.y}, Vec2{b.x+outer.x,b.y+outer.y}
+	co, d_outer := Vec2{a.x-outer.x,a.y-outer.y}, Vec2{b.x-outer.x,b.y-outer.y}
+	transparent := with_alpha(color, 0)
+
+	append_triangle(vertices, ai, ci, bi, color)
+	append_triangle(vertices, bi, ci, di, color)
+	append_colored_triangle(vertices, vertex(ao, transparent), vertex(ai, color), vertex(bo, transparent))
+	append_colored_triangle(vertices, vertex(bo, transparent), vertex(ai, color), vertex(bi, color))
+	append_colored_triangle(vertices, vertex(ci, color), vertex(co, transparent), vertex(di, color))
+	append_colored_triangle(vertices, vertex(di, color), vertex(co, transparent), vertex(d_outer, transparent))
+}
+
+append_antialiased_node :: proc(
+	vertices: ^[dynamic]Vertex,
+	center: Vec2,
+	radius: f32,
+	color: [4]f32,
+) {
+	segments := 28
+	outer_radius := radius + 0.0022
+	transparent := with_alpha(color, 0)
+	for segment in 0..<segments {
+		a0 := f32(segment) / f32(segments) * 2*math.PI
+		a1 := f32(segment+1) / f32(segments) * 2*math.PI
+		i0 := Vec2{center.x + math.cos(a0)*radius, center.y + math.sin(a0)*radius}
+		i1 := Vec2{center.x + math.cos(a1)*radius, center.y + math.sin(a1)*radius}
+		o0 := Vec2{center.x + math.cos(a0)*outer_radius, center.y + math.sin(a0)*outer_radius}
+		o1 := Vec2{center.x + math.cos(a1)*outer_radius, center.y + math.sin(a1)*outer_radius}
+		append_triangle(vertices, center, i0, i1, color)
+		append_colored_triangle(vertices, vertex(i0, color), vertex(o0, transparent), vertex(i1, color))
+		append_colored_triangle(vertices, vertex(i1, color), vertex(o0, transparent), vertex(o1, transparent))
+	}
+}
+
+load_font :: proc(path: string, pixel_height: f32) {
+	if len(path) == 0 { return }
+	g_font_bitmap = make([]byte, FONT_ATLAS_WIDTH*FONT_ATLAS_HEIGHT)
+	g_font_pixel_height = max(pixel_height, 8)
+	c_path := strings.clone_to_cstring(path)
+	result := synapse_bake_font(
+		c_path, g_font_pixel_height,
+		raw_data(g_font_bitmap), FONT_ATLAS_WIDTH, FONT_ATLAS_HEIGHT,
+		FONT_FIRST, FONT_LAST-FONT_FIRST+1, &g_font_chars[0], &g_font_ascent,
 	)
+	delete(c_path)
+	if result == 0 {
+		log.warnf("synapse: could not rasterize terminal font %q", path)
+		delete(g_font_bitmap)
+		g_font_bitmap = nil
+		return
+	}
+	g_font_ready = true
+	log.infof("synapse: using terminal font %q at %.1f px", path, g_font_pixel_height)
+}
+
+glyph_rows :: proc(character: byte) -> [7]u8 {
+	c := character
+	if c >= 'a' && c <= 'z' { c -= 'a'-'A' }
+	switch c {
+	case 'A': return {14,17,17,31,17,17,17}
+	case 'B': return {30,17,17,30,17,17,30}
+	case 'C': return {14,17,16,16,16,17,14}
+	case 'D': return {30,17,17,17,17,17,30}
+	case 'E': return {31,16,16,30,16,16,31}
+	case 'F': return {31,16,16,30,16,16,16}
+	case 'G': return {14,17,16,23,17,17,15}
+	case 'H': return {17,17,17,31,17,17,17}
+	case 'I': return {14,4,4,4,4,4,14}
+	case 'J': return {7,2,2,2,18,18,12}
+	case 'K': return {17,18,20,24,20,18,17}
+	case 'L': return {16,16,16,16,16,16,31}
+	case 'M': return {17,27,21,21,17,17,17}
+	case 'N': return {17,25,21,19,17,17,17}
+	case 'O': return {14,17,17,17,17,17,14}
+	case 'P': return {30,17,17,30,16,16,16}
+	case 'Q': return {14,17,17,17,21,18,13}
+	case 'R': return {30,17,17,30,20,18,17}
+	case 'S': return {15,16,16,14,1,1,30}
+	case 'T': return {31,4,4,4,4,4,4}
+	case 'U': return {17,17,17,17,17,17,14}
+	case 'V': return {17,17,17,17,17,10,4}
+	case 'W': return {17,17,17,21,21,21,10}
+	case 'X': return {17,17,10,4,10,17,17}
+	case 'Y': return {17,17,10,4,4,4,4}
+	case 'Z': return {31,1,2,4,8,16,31}
+	case '0': return {14,17,19,21,25,17,14}
+	case '1': return {4,12,4,4,4,4,14}
+	case '2': return {14,17,1,2,4,8,31}
+	case '3': return {30,1,1,14,1,1,30}
+	case '4': return {2,6,10,18,31,2,2}
+	case '5': return {31,16,16,30,1,1,30}
+	case '6': return {14,16,16,30,17,17,14}
+	case '7': return {31,1,2,4,8,8,8}
+	case '8': return {14,17,17,14,17,17,14}
+	case '9': return {14,17,17,15,1,1,14}
+	case '-': return {0,0,0,31,0,0,0}
+	case '_': return {0,0,0,0,0,0,31}
+	case '/': return {1,2,2,4,8,8,16}
+	case '.': return {0,0,0,0,0,12,12}
+	case ':': return {0,12,12,0,12,12,0}
+	case '?': return {14,17,1,2,4,0,4}
+	case ' ': return {}
+	}
+	return {14,17,1,2,4,0,4}
+}
+
+append_screen_rect :: proc(vertices: ^[dynamic]Vertex, min, max: Vec2, color: [4]f32) {
+	append_triangle(vertices, min, {max.x,min.y}, {min.x,max.y}, color, 1)
+	append_triangle(vertices, {min.x,max.y}, {max.x,min.y}, max, color, 1)
+}
+
+font_character_index :: proc(codepoint: rune) -> int {
+	value := codepoint
+	if value < FONT_FIRST || value > FONT_LAST { value = '?' }
+	return int(value)-FONT_FIRST
+}
+
+append_hover_label :: proc(vertices: ^[dynamic]Vertex, title: string, center: Vec2, radius: f32) {
+	if !g_font_ready { return }
+	frame_width, frame_height := glfw.GetFramebufferSize(g_window)
+	if frame_width <= 0 || frame_height <= 0 { return }
+
+	width_pixels: f32
+	character_count := 0
+	for codepoint in title {
+		if character_count >= 48 { break }
+		width_pixels += g_font_chars[font_character_index(codepoint)].advance
+		character_count += 1
+	}
+	if character_count == 0 { return }
+
+	aspect := f32(frame_width)/f32(frame_height)
+	center_ndc := Vec2{
+		(center.x+g_pan.x)*g_zoom/aspect,
+		(center.y+g_pan.y)*g_zoom,
+	}
+	text_width_ndc := width_pixels*2/f32(frame_width)
+	left := clamp(center_ndc.x-text_width_ndc/2, -0.97, 0.97-text_width_ndc)
+	text_height_ndc := g_font_pixel_height*2/f32(frame_height)
+	top := center_ndc.y + radius*g_zoom + 10/f32(frame_height)
+	if top+text_height_ndc > 0.97 { top = 0.97-text_height_ndc }
+
+	padding_x := 5/f32(frame_width)
+	padding_y := 4/f32(frame_height)
+	append_screen_rect(
+		vertices,
+		{left-padding_x, top-padding_y},
+		{left+text_width_ndc+padding_x, top+text_height_ndc+padding_y},
+		with_alpha(g_background, 0.90),
+	)
+
+	cursor_x: f32
+	drawn := 0
+	for codepoint in title {
+		if drawn >= 48 { break }
+		glyph := g_font_chars[font_character_index(codepoint)]
+		glyph_left := cursor_x+f32(glyph.bearing_x)
+		glyph_top := g_font_ascent-f32(glyph.bearing_y)
+		for row in 0..<int(glyph.height) {
+			for column in 0..<int(glyph.width) {
+				coverage := g_font_bitmap[(int(glyph.y)+row)*FONT_ATLAS_WIDTH+int(glyph.x)+column]
+				if coverage < 8 { continue }
+				x0 := left + (glyph_left+f32(column))*2/f32(frame_width)
+				y0 := top + (glyph_top+f32(row))*2/f32(frame_height)
+				x1 := x0 + 2/f32(frame_width)
+				y1 := y0 + 2/f32(frame_height)
+				append_screen_rect(vertices, {x0,y0}, {x1,y1}, with_alpha(g_text_color, f32(coverage)/255))
+			}
+		}
+		cursor_x += glyph.advance
+		drawn += 1
+	}
 }
 
 build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
-	vertices := make([dynamic]Vertex, 0, len(graph.edges)*6 + len(graph.notes)*36)
-	degrees := make([]int, len(graph.notes), context.temp_allocator)
-	for edge in graph.edges { degrees[edge.from] += 1; degrees[edge.to] += 1 }
-
-	// Links are thin transparent quads, emitted first so nodes stay crisp.
-	for edge in graph.edges {
-		a, b := graph.notes[edge.from].pos, graph.notes[edge.to].pos
-		dx, dy := b.x-a.x, b.y-a.y
-		length := math.sqrt(dx*dx + dy*dy)
-		if length < 0.0001 { continue }
-		width: f32 = 0.0022
-		n := Vec2{-dy/length*width, dx/length*width}
-		p0, p1 := Vec2{a.x+n.x,a.y+n.y}, Vec2{a.x-n.x,a.y-n.y}
-		p2, p3 := Vec2{b.x+n.x,b.y+n.y}, Vec2{b.x-n.x,b.y-n.y}
-		color := g_edge_color
-		append_triangle(&vertices, p0, p1, p2, color)
-		append_triangle(&vertices, p2, p1, p3, color)
+	vertices := make([dynamic]Vertex, 0, len(graph.edges)*24 + len(graph.notes)*252)
+	connected := make([]bool, len(graph.notes), context.temp_allocator)
+	if g_last_hovered >= 0 && g_last_hovered < len(graph.notes) {
+		connected[g_last_hovered] = true
+		for edge in graph.edges {
+			if edge.from == g_last_hovered { connected[edge.to] = true }
+			if edge.to == g_last_hovered { connected[edge.from] = true }
+		}
 	}
 
-	segments := 14
+	for edge in graph.edges {
+		a, b := graph.notes[edge.from].pos, graph.notes[edge.to].pos
+		is_hover_link := g_last_hovered >= 0 && (edge.from == g_last_hovered || edge.to == g_last_hovered)
+		is_ghost := !graph.notes[edge.from].exists || !graph.notes[edge.to].exists
+		color := is_ghost ? with_alpha(g_ghost_color, 0.65) : g_edge_color
+		width: f32 = 0.0018
+		if is_hover_link {
+			color = with_alpha(g_highlight_color, 0.9)
+			width = 0.0032
+		} else if g_last_hovered >= 0 {
+			color = with_alpha(color, 0.28)
+		}
+		append_antialiased_link(&vertices, a, b, color, width)
+	}
+
 	for note, i in graph.notes {
-		radius: f32 = 0.011 + min(f32(degrees[i]), 12)*0.0011
+		radius := node_radius(g_degrees[i])
 		color := g_node_color
-		if degrees[i] == 0 { color = g_muted_color }
-		if len(current) > 0 && note.id == current {
-			color = g_highlight_color
-			radius *= 1.45
+		if !note.exists {
+			color = g_ghost_color
+		} else if g_degrees[i] == 0 {
+			color = g_muted_color
 		}
-		for segment in 0..<segments {
-			a0 := f32(segment) / f32(segments) * 2*math.PI
-			a1 := f32(segment+1) / f32(segments) * 2*math.PI
-			p0 := Vec2{note.pos.x + math.cos(a0)*radius, note.pos.y + math.sin(a0)*radius}
-			p1 := Vec2{note.pos.x + math.cos(a1)*radius, note.pos.y + math.sin(a1)*radius}
-			append_triangle(&vertices, note.pos, p0, p1, color)
+		if len(current) > 0 && note.id == current { color = g_highlight_color }
+		if g_last_hovered >= 0 {
+			if i == g_last_hovered {
+				color = g_highlight_color
+				radius *= 1.7
+			} else if connected[i] {
+				color = mix_color(color, g_highlight_color, 0.55)
+				radius *= 1.15
+			} else {
+				color = with_alpha(color, 0.48)
+			}
 		}
+		append_antialiased_node(&vertices, note.pos, radius, color)
+	}
+
+	if g_last_hovered >= 0 && g_last_hovered < len(graph.notes) {
+		hovered := graph.notes[g_last_hovered]
+		radius := node_radius(g_degrees[g_last_hovered])*1.7
+		append_hover_label(&vertices, hovered.title, hovered.pos, radius)
 	}
 	return vertices
 }
@@ -1107,27 +1395,34 @@ load_theme :: proc(path: string) -> bool {
 	if len(path) == 0 { return false }
 	data, err := os.read_entire_file(path, context.temp_allocator)
 	if err != nil { return false }
-	colors := [5][4]f32{g_background, g_node_color, g_edge_color, g_muted_color, g_highlight_color}
+	colors := [7][4]f32{
+		g_background, g_text_color, g_node_color, g_edge_color,
+		g_muted_color, g_highlight_color, g_ghost_color,
+	}
 	text := string(data)
 	count := 0
 	for line in strings.split_lines_iterator(&text) {
 		if count >= len(colors) { break }
 		alpha: f32 = 1
-		if count == 2 { alpha = 0.42 }
+		if count == 3 { alpha = 0.42 }
+		if count == 6 { alpha = 0.82 }
 		color, ok := parse_hex_color(line, alpha)
 		if !ok { return false }
 		colors[count] = color
 		count += 1
 	}
 	if count != len(colors) { return false }
-	changed := colors[0] != g_background || colors[1] != g_node_color ||
-	           colors[2] != g_edge_color || colors[3] != g_muted_color ||
-	           colors[4] != g_highlight_color
+	changed := colors[0] != g_background || colors[1] != g_text_color ||
+	           colors[2] != g_node_color || colors[3] != g_edge_color ||
+	           colors[4] != g_muted_color || colors[5] != g_highlight_color ||
+	           colors[6] != g_ghost_color
 	g_background = colors[0]
-	g_node_color = colors[1]
-	g_edge_color = colors[2]
-	g_muted_color = colors[3]
-	g_highlight_color = colors[4]
+	g_text_color = colors[1]
+	g_node_color = colors[2]
+	g_edge_color = colors[3]
+	g_muted_color = colors[4]
+	g_highlight_color = colors[5]
+	g_ghost_color = colors[6]
 	return changed
 }
 
@@ -1181,15 +1476,16 @@ reload_graph_if_changed :: proc() {
 	graph, ok := load_graph(g_root)
 	if !ok { return }
 	layout_graph(&graph)
-	vertices := build_mesh(&graph, g_current)
+	g_last_hovered = -1
+	destroy_graph(&g_graph)
+	g_graph = graph
+	rebuild_degrees()
+	vertices := build_mesh(&g_graph, g_current)
 
 	// Command buffers may still refer to the old vertex buffer. Waiting here is
 	// infrequent and lets us replace only GPU graph data, not the native window.
 	replace_vertex_data(vertices)
-	destroy_graph(&g_graph)
-	g_graph = graph
 	g_vault_fingerprint = fingerprint
-	g_last_hovered = -2
 
 	title := fmt.tprintf("Synapse — %d notes · %d links", len(g_graph.notes), len(g_graph.edges))
 	glfw.SetWindowTitle(g_window, strings.clone_to_cstring(title, context.temp_allocator))
@@ -1242,22 +1538,23 @@ handle_input :: proc() {
 	if glfw.GetKey(g_window, glfw.KEY_MINUS) == glfw.PRESS { g_zoom = max(g_zoom/1.02, 0.25) }
 	if glfw.GetKey(g_window, glfw.KEY_0) == glfw.PRESS { g_zoom = 1; g_pan = {} }
 
-	// Hovering a node exposes its title and repository-relative path without
-	// introducing a font atlas dependency into the Vulkan renderer.
+	// Hovering rebuilds only the small graph vertex buffer. The native window,
+	// swapchain, camera position, and Vulkan pipeline all remain intact.
 	x, y := glfw.GetCursorPos(g_window)
 	w, h := glfw.GetWindowSize(g_window)
 	if w <= 0 || h <= 0 { return }
 	aspect := f32(w)/f32(h)
 	world := Vec2{
 		(f32(x)/f32(w)*2-1)*aspect/g_zoom - g_pan.x,
-		(1-f32(y)/f32(h)*2)/g_zoom - g_pan.y,
+		(f32(y)/f32(h)*2-1)/g_zoom - g_pan.y,
 	}
 	hovered := -1
-	best: f32 = 0.0012/(g_zoom*g_zoom)
+	best := max(f32)
 	for note, i in g_graph.notes {
 		dx, dy := note.pos.x-world.x, note.pos.y-world.y
 		d2 := dx*dx+dy*dy
-		if d2 < best { best = d2; hovered = i }
+		hit_radius := node_radius(g_degrees[i]) + 0.008/g_zoom
+		if d2 <= hit_radius*hit_radius && d2 < best { best = d2; hovered = i }
 	}
 	if hovered != g_last_hovered {
 		if hovered >= 0 {
@@ -1268,6 +1565,7 @@ handle_input :: proc() {
 			glfw.SetWindowTitle(g_window, strings.clone_to_cstring(title, context.temp_allocator))
 		}
 		g_last_hovered = hovered
+		replace_vertex_data(build_mesh(&g_graph, g_current))
 	}
 }
 

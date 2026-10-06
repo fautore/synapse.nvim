@@ -2,6 +2,7 @@
 
 layout(location = 0) in vec2 inPosition;
 layout(location = 1) in vec4 inColor;
+layout(location = 2) in float inScreen;
 layout(location = 0) out vec4 fragColor;
 
 layout(push_constant) uniform View {
@@ -11,8 +12,11 @@ layout(push_constant) uniform View {
 } view;
 
 void main() {
-    vec2 position = (inPosition + view.pan) * view.zoom;
-    position.x /= view.aspect;
+    vec2 position = inPosition;
+    if (inScreen < 0.5) {
+        position = (inPosition + view.pan) * view.zoom;
+        position.x /= view.aspect;
+    }
     gl_Position = vec4(position, 0.0, 1.0);
     fragColor = inColor;
 }

@@ -8,14 +8,19 @@ local defaults = {
   executable = plugin_root .. "/target/synapse",
   odin = "odin",
   glslc = "glslc",
+  make = "make",
   auto_build = true,
+  font = nil, -- font file or Fontconfig family; nil detects the terminal
+  font_size = nil,
   root_markers = { ".obsidian", ".git", ".jj" },
   highlight_groups = {
     background = "Normal",
+    foreground = "Normal",
     node = "Function",
     edge = "Comment",
     muted = "NonText",
     current = "DiagnosticWarn",
+    ghost = "LineNr",
   },
 }
 
@@ -24,6 +29,8 @@ local state = {
   process = nil,
   building = false,
   theme_file = vim.fn.stdpath("cache") .. "/synapse-theme-" .. vim.fn.getpid(),
+  font_path = nil,
+  font_size = nil,
 }
 
 local function notify(message, level)
@@ -48,11 +55,15 @@ local function needs_build()
   end
   local source_time = binary.mtime.sec
   for name, kind in vim.fs.dir(plugin_root .. "/app") do
-    if kind == "file" and (name:match("%.odin$") or name:match("%.vert$") or name:match("%.frag$")) then
+    if kind == "file" and
+        (name:match("%.odin$") or name:match("%.c$") or name:match("%.vert$") or name:match("%.frag$")) then
       if newer_than(plugin_root .. "/app/" .. name, source_time) then
         return true
       end
     end
+  end
+  if newer_than(plugin_root .. "/Makefile", source_time) then
+    return true
   end
   return false
 end
@@ -90,10 +101,12 @@ local function write_theme_file()
   local normal_fg = highlight_color("Normal", "fg", 0xcdd6f4)
   local colors = {
     highlight_color(config.highlight_groups.background, "bg", 0x11111b),
+    highlight_color(config.highlight_groups.foreground, "fg", normal_fg),
     highlight_color(config.highlight_groups.node, "fg", normal_fg),
     highlight_color(config.highlight_groups.edge, "fg", normal_fg),
     highlight_color(config.highlight_groups.muted, "fg", normal_fg),
     highlight_color(config.highlight_groups.current, "fg", 0xf9e2af),
+    highlight_color(config.highlight_groups.ghost, "fg", 0x585b70),
   }
   local temporary = state.theme_file .. ".tmp"
   local file = assert(io.open(temporary, "w"))
@@ -104,6 +117,51 @@ local function write_theme_file()
   assert(os.rename(temporary, state.theme_file))
 end
 
+local function read_font_setting(path, family_pattern, size_pattern)
+  if vim.fn.filereadable(path) ~= 1 then
+    return nil, nil
+  end
+  local family, size
+  for _, line in ipairs(vim.fn.readfile(path)) do
+    line = line:gsub("%s*#.*$", "")
+    family = line:match(family_pattern) or family
+    size = tonumber(line:match(size_pattern)) or size
+  end
+  return family, size
+end
+
+local function terminal_font()
+  if state.font_path then
+    return state.font_path, state.font_size
+  end
+
+  local family, size
+  if vim.env.KITTY_WINDOW_ID or vim.env.TERM == "xterm-kitty" then
+    family, size = read_font_setting(
+      vim.fn.expand("~/.config/kitty/kitty.conf"),
+      "^%s*font_family%s+(.+)%s*$",
+      "^%s*font_size%s+([%d%.]+)"
+    )
+  elseif vim.env.TERM_PROGRAM == "ghostty" or vim.env.GHOSTTY_RESOURCES_DIR then
+    family, size = read_font_setting(
+      vim.fn.expand("~/.config/ghostty/config"),
+      '^%s*font%-family%s*=%s*"?([^"%s]+.-)"?%s*$',
+      "^%s*font%-size%s*=%s*([%d%.]+)"
+    )
+  end
+
+  local requested = config.font or family or "monospace"
+  size = config.font_size or size or 10
+  if uv.fs_stat(vim.fn.expand(requested)) then
+    state.font_path = vim.fn.expand(requested)
+  elseif vim.fn.executable("fc-match") == 1 then
+    local result = vim.system({ "fc-match", "-f", "%{file}", requested }, { text = true }):wait()
+    state.font_path = result.code == 0 and vim.trim(result.stdout or "") or nil
+  end
+  state.font_size = size
+  return state.font_path, state.font_size
+end
+
 local function launch(root, current)
   if state.process then
     notify("A Synapse window is already running (use :Synapse! to restart)", vim.log.levels.WARN)
@@ -111,7 +169,11 @@ local function launch(root, current)
   end
 
   write_theme_file()
+  local font_path, font_size = terminal_font()
   local args = { config.executable, "--root", root, "--theme-file", state.theme_file }
+  if font_path then
+    vim.list_extend(args, { "--font", font_path, "--font-size", tostring(font_size) })
+  end
   if current ~= "" then
     vim.list_extend(args, { "--current", current })
   end
@@ -165,19 +227,27 @@ local function build(callback)
     notify("glslc was not found (install the Vulkan SDK)", vim.log.levels.ERROR)
     return
   end
+  if vim.fn.executable(config.make) ~= 1 then
+    notify("make was not found", vim.log.levels.ERROR)
+    return
+  end
 
   state.building = true
   vim.fn.mkdir(vim.fs.dirname(config.executable), "p")
   notify("Building the Odin/Vulkan renderer…")
   run_steps({
-    { config.glslc, "app/graph.vert", "-o", "app/vert.spv" },
-    { config.glslc, "app/graph.frag", "-o", "app/frag.spv" },
-    { config.odin, "build", "app", "-out:" .. config.executable, "-o:speed" },
+    {
+      config.make,
+      "ODIN=" .. config.odin,
+      "GLSLC=" .. config.glslc,
+      "OUT=" .. config.executable,
+      "all",
+    },
   }, function(ok)
     state.building = false
     if ok then
       notify("Renderer built")
-      if callback then callback() end
+      if callback then vim.schedule(callback) end
     end
   end)
 end
@@ -219,6 +289,8 @@ end
 
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})
+  state.font_path = nil
+  state.font_size = nil
 end
 
 M._state = state
