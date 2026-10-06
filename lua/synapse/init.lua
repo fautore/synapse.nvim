@@ -10,10 +10,21 @@ local defaults = {
   glslc = "glslc",
   auto_build = true,
   root_markers = { ".obsidian", ".git", ".jj" },
+  highlight_groups = {
+    background = "Normal",
+    node = "Function",
+    edge = "Comment",
+    muted = "NonText",
+    current = "DiagnosticWarn",
+  },
 }
 
 local config = vim.deepcopy(defaults)
-local state = { process = nil, building = false }
+local state = {
+  process = nil,
+  building = false,
+  theme_file = vim.fn.stdpath("cache") .. "/synapse-theme-" .. vim.fn.getpid(),
+}
 
 local function notify(message, level)
   vim.schedule(function()
@@ -67,13 +78,40 @@ local function vault_for_buffer(bufnr)
   return vim.fs.normalize(root), current
 end
 
+local function highlight_color(group, attribute, fallback)
+  local ok, highlight = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+  if ok and highlight[attribute] then
+    return highlight[attribute]
+  end
+  return fallback
+end
+
+local function write_theme_file()
+  local normal_fg = highlight_color("Normal", "fg", 0xcdd6f4)
+  local colors = {
+    highlight_color(config.highlight_groups.background, "bg", 0x11111b),
+    highlight_color(config.highlight_groups.node, "fg", normal_fg),
+    highlight_color(config.highlight_groups.edge, "fg", normal_fg),
+    highlight_color(config.highlight_groups.muted, "fg", normal_fg),
+    highlight_color(config.highlight_groups.current, "fg", 0xf9e2af),
+  }
+  local temporary = state.theme_file .. ".tmp"
+  local file = assert(io.open(temporary, "w"))
+  for _, color in ipairs(colors) do
+    file:write(string.format("%06x\n", color))
+  end
+  file:close()
+  assert(os.rename(temporary, state.theme_file))
+end
+
 local function launch(root, current)
   if state.process then
     notify("A Synapse window is already running (use :Synapse! to restart)", vim.log.levels.WARN)
     return
   end
 
-  local args = { config.executable, "--root", root }
+  write_theme_file()
+  local args = { config.executable, "--root", root, "--theme-file", state.theme_file }
   if current ~= "" then
     vim.list_extend(args, { "--current", current })
   end
@@ -166,6 +204,12 @@ function M.close()
   if state.process then
     state.process:kill(15)
     state.process = nil
+  end
+end
+
+function M.update_theme()
+  if state.process then
+    write_theme_file()
   end
 end
 

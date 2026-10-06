@@ -20,6 +20,13 @@ end, { desc = "Build the Synapse Odin/Vulkan renderer" })
 
 local group = vim.api.nvim_create_augroup("synapse_nvim", { clear = true })
 
+vim.api.nvim_create_autocmd("ColorScheme", {
+  group = group,
+  callback = function()
+    require("synapse").update_theme()
+  end,
+})
+
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = group,
   callback = function()

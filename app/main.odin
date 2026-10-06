@@ -54,6 +54,13 @@ g_root: string
 g_current: string
 g_vault_fingerprint: u64
 g_next_vault_scan: f64
+g_theme_file: string
+g_next_theme_scan: f64
+g_background := [4]f32{0.025, 0.035, 0.055, 1.0}
+g_node_color := [4]f32{0.30, 0.68, 0.96, 1.0}
+g_edge_color := [4]f32{0.35, 0.48, 0.68, 0.42}
+g_muted_color := [4]f32{0.43, 0.48, 0.58, 1.0}
+g_highlight_color := [4]f32{1.0, 0.70, 0.22, 1.0}
 
 Vertex :: struct {
 	x, y:       f32,
@@ -105,7 +112,8 @@ main :: proc() {
 	context.logger = log.create_console_logger()
 	g_ctx = context
 
-	g_root, g_current = parse_arguments()
+	g_root, g_current, g_theme_file = parse_arguments()
+	load_theme(g_theme_file)
 	ok: bool
 	g_graph, ok = load_graph(g_root)
 	if !ok { log.panicf("could not scan vault %q", g_root) }
@@ -474,6 +482,7 @@ main :: proc() {
 		glfw.PollEvents()
 		handle_input()
 		reload_graph_if_changed()
+		reload_theme_if_changed()
 
 		// Wait for previous frame.
 		must(vk.WaitForFences(g_device, 1, &g_in_flight_fences[current_frame], true, max(u64)))
@@ -934,7 +943,7 @@ record_command_buffer :: proc(command_buffer: vk.CommandBuffer, image_index: u32
 	must(vk.BeginCommandBuffer(command_buffer, &begin_info))
 
 	clear_color := vk.ClearValue{}
-	clear_color.color.float32 = {0.025, 0.035, 0.055, 1.0}
+	clear_color.color.float32 = g_background
 
 	render_pass_info := vk.RenderPassBeginInfo {
 		sType = .RENDER_PASS_BEGIN_INFO,
@@ -972,7 +981,7 @@ record_command_buffer :: proc(command_buffer: vk.CommandBuffer, image_index: u32
 	must(vk.EndCommandBuffer(command_buffer))
 }
 
-parse_arguments :: proc() -> (root, current: string) {
+parse_arguments :: proc() -> (root, current, theme_file: string) {
 	root = "."
 	for i := 1; i < len(os.args); i += 1 {
 		switch os.args[i] {
@@ -980,6 +989,8 @@ parse_arguments :: proc() -> (root, current: string) {
 			if i+1 < len(os.args) { i += 1; root = os.args[i] }
 		case "--current":
 			if i+1 < len(os.args) { i += 1; current = normalize_id(os.args[i]) }
+		case "--theme-file":
+			if i+1 < len(os.args) { i += 1; theme_file = os.args[i] }
 		case:
 			// A positional path is convenient when running the renderer by hand.
 			if i == 1 { root = os.args[i] }
@@ -1011,7 +1022,7 @@ build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
 		n := Vec2{-dy/length*width, dx/length*width}
 		p0, p1 := Vec2{a.x+n.x,a.y+n.y}, Vec2{a.x-n.x,a.y-n.y}
 		p2, p3 := Vec2{b.x+n.x,b.y+n.y}, Vec2{b.x-n.x,b.y-n.y}
-		color := [4]f32{0.35, 0.48, 0.68, 0.42}
+		color := g_edge_color
 		append_triangle(&vertices, p0, p1, p2, color)
 		append_triangle(&vertices, p2, p1, p3, color)
 	}
@@ -1019,10 +1030,10 @@ build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
 	segments := 14
 	for note, i in graph.notes {
 		radius: f32 = 0.011 + min(f32(degrees[i]), 12)*0.0011
-		color := [4]f32{0.30, 0.68, 0.96, 1.0}
-		if degrees[i] == 0 { color = {0.43, 0.48, 0.58, 1.0} }
+		color := g_node_color
+		if degrees[i] == 0 { color = g_muted_color }
 		if len(current) > 0 && note.id == current {
-			color = {1.0, 0.70, 0.22, 1.0}
+			color = g_highlight_color
 			radius *= 1.45
 		}
 		for segment in 0..<segments {
@@ -1055,6 +1066,86 @@ destroy_vertex_buffer :: proc() {
 	if g_vertex_memory != 0 {
 		vk.FreeMemory(g_device, g_vertex_memory, nil)
 		g_vertex_memory = {}
+	}
+}
+
+hex_digit :: proc(value: byte) -> (u8, bool) {
+	switch value {
+	case '0'..='9': return value-'0', true
+	case 'a'..='f': return value-'a'+10, true
+	case 'A'..='F': return value-'A'+10, true
+	}
+	return 0, false
+}
+
+srgb_to_linear :: proc(value: f32) -> f32 {
+	if value <= 0.04045 { return value / 12.92 }
+	return math.pow((value + 0.055) / 1.055, 2.4)
+}
+
+parse_hex_color :: proc(text: string, alpha: f32 = 1.0) -> (color: [4]f32, ok: bool) {
+	value := strings.trim_space(text)
+	if strings.has_prefix(value, "#") { value = value[1:] }
+	if len(value) != 6 { return }
+	values: [3]u8
+	for channel in 0..<3 {
+		hi, hi_ok := hex_digit(value[channel*2])
+		lo, lo_ok := hex_digit(value[channel*2+1])
+		if !hi_ok || !lo_ok { return }
+		values[channel] = hi*16+lo
+	}
+	color = {
+		srgb_to_linear(f32(values[0])/255),
+		srgb_to_linear(f32(values[1])/255),
+		srgb_to_linear(f32(values[2])/255),
+		alpha,
+	}
+	return color, true
+}
+
+load_theme :: proc(path: string) -> bool {
+	if len(path) == 0 { return false }
+	data, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil { return false }
+	colors := [5][4]f32{g_background, g_node_color, g_edge_color, g_muted_color, g_highlight_color}
+	text := string(data)
+	count := 0
+	for line in strings.split_lines_iterator(&text) {
+		if count >= len(colors) { break }
+		alpha: f32 = 1
+		if count == 2 { alpha = 0.42 }
+		color, ok := parse_hex_color(line, alpha)
+		if !ok { return false }
+		colors[count] = color
+		count += 1
+	}
+	if count != len(colors) { return false }
+	changed := colors[0] != g_background || colors[1] != g_node_color ||
+	           colors[2] != g_edge_color || colors[3] != g_muted_color ||
+	           colors[4] != g_highlight_color
+	g_background = colors[0]
+	g_node_color = colors[1]
+	g_edge_color = colors[2]
+	g_muted_color = colors[3]
+	g_highlight_color = colors[4]
+	return changed
+}
+
+replace_vertex_data :: proc(vertices: [dynamic]Vertex) {
+	must(vk.DeviceWaitIdle(g_device))
+	destroy_vertex_buffer()
+	delete(g_vertices)
+	g_vertices = vertices
+	create_vertex_buffer(g_vertices[:])
+}
+
+reload_theme_if_changed :: proc() {
+	now := glfw.GetTime()
+	if now < g_next_theme_scan { return }
+	g_next_theme_scan = now + 0.25
+	if load_theme(g_theme_file) {
+		replace_vertex_data(build_mesh(&g_graph, g_current))
+		log.info("synapse: updated colors from Neovim")
 	}
 }
 
@@ -1094,13 +1185,9 @@ reload_graph_if_changed :: proc() {
 
 	// Command buffers may still refer to the old vertex buffer. Waiting here is
 	// infrequent and lets us replace only GPU graph data, not the native window.
-	must(vk.DeviceWaitIdle(g_device))
-	destroy_vertex_buffer()
-	delete(g_vertices)
+	replace_vertex_data(vertices)
 	destroy_graph(&g_graph)
 	g_graph = graph
-	g_vertices = vertices
-	create_vertex_buffer(g_vertices[:])
 	g_vault_fingerprint = fingerprint
 	g_last_hovered = -2
 

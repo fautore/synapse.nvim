@@ -6,6 +6,7 @@ A Neovim extension that scans the repository containing the current buffer and o
 - force-directed layout and degree-based node sizing
 - current-buffer node highlighted in amber
 - live in-window graph reload for Markdown changes, including changes made outside Neovim
+- colors inherited from Neovim and updated live on `:colorscheme` changes
 - hover a node to show its title and repository-relative path
 - GPU rendering through Vulkan; GLFW is used only for the native window/input
 - repository detection via `.obsidian`, `.git`, or `.jj`
@@ -74,6 +75,13 @@ require("synapse").setup({
   odin = "odin",
   glslc = "glslc",
   root_markers = { ".obsidian", ".git", ".jj" },
+  highlight_groups = {
+    background = "Normal",       -- background color
+    node = "Function",           -- connected notes
+    edge = "Comment",            -- links
+    muted = "NonText",           -- unlinked notes
+    current = "DiagnosticWarn",  -- current-buffer note
+  },
   -- root = "/fixed/vault", -- string or function(start_path) -> root
   -- executable = vim.fn.stdpath("data") .. "/synapse/synapse",
 })
