@@ -101,6 +101,25 @@ require("synapse").setup({
 
 Directories such as `.git`, `.jj`, `.obsidian`, `node_modules`, `.direnv`, and `target` are skipped while scanning.
 
+## Physics tuning
+
+Runtime graph behavior is controlled by the constants grouped under
+`// Physics tuning` near the top of `src/main.odin`:
+
+| Constant | Effect |
+|---|---|
+| `PHYSICS_REPULSION` | node-to-node repulsive force |
+| `PHYSICS_LINK_DISTANCE` | preferred connector length |
+| `PHYSICS_LINK_STRENGTH` | connector spring strength |
+| `PHYSICS_CENTER_GRAVITY` | pull toward the center |
+| `PHYSICS_DAMPING` | retained inertia; closer to `1` coasts longer |
+| `PHYSICS_MAX_SPEED` | velocity limit |
+| `PHYSICS_SETTLE_ENERGY` | motion threshold below which settling starts |
+| `PHYSICS_SETTLE_TIME_MS` | continuous quiet time in milliseconds before rendering sleeps |
+
+Only measured kinetic energy and `PHYSICS_SETTLE_TIME_MS` stop the simulation;
+there is no fixed runtime cutoff.
+
 ## Development
 
 Project layout:

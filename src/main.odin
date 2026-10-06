@@ -62,8 +62,7 @@ g_edge_focus: []f32
 g_hover_presence: f32
 g_simulation_active := true
 g_visual_animation_active: bool
-g_simulation_frames: int
-g_stable_frames: int
+g_stable_time_ms: f32
 g_mesh_dirty: bool
 g_last_frame_time: f64
 g_degrees: []int
@@ -89,25 +88,17 @@ g_font_chars: [224]Font_Glyph
 g_font_ready: bool
 
 Font_Glyph :: struct {
-	x, y:               i32,
-	width, height:      i32,
+	x, y:                 i32,
+	width, height:        i32,
 	bearing_x, bearing_y: i32,
-	advance:            f32,
+	advance:              f32,
 }
 
-@(require, extra_linker_flags="-lfreetype")
+@(require, extra_linker_flags = "-lfreetype")
 foreign import font_bridge "../target/libfont_bridge.a"
 
 foreign font_bridge {
-	synapse_bake_font :: proc "c" (
-		path: cstring,
-		pixel_height: f32,
-		atlas: [^]byte,
-		atlas_width, atlas_height: i32,
-		first_codepoint, codepoint_count: i32,
-		glyphs: [^]Font_Glyph,
-		ascent: ^f32,
-	) -> i32 ---
+	synapse_bake_font :: proc "c" (path: cstring, pixel_height: f32, atlas: [^]byte, atlas_width, atlas_height: i32, first_codepoint, codepoint_count: i32, glyphs: [^]Font_Glyph, ascent: ^f32) -> i32 ---
 }
 
 FONT_FIRST :: 32
@@ -115,10 +106,30 @@ FONT_LAST :: 255
 FONT_ATLAS_WIDTH :: 1024
 FONT_ATLAS_HEIGHT :: 512
 
+// Physics tuning. These values are intentionally kept together so the graph
+// can be tuned without digging through the simulation loop.
+//
+// DAMPING: 0 removes all inertia; values nearer 1 coast for longer.
+// SETTLE_ENERGY: lower values require slower motion before sleeping.
+// SETTLE_TIME_MS: continuous low-energy time required before sleeping.
+PHYSICS_REFERENCE_FPS          :: f32(60)
+PHYSICS_REPULSION              :: f32(0.00012)
+PHYSICS_REPULSION_SOFTENING    :: f32(0.0015)
+PHYSICS_LINK_DISTANCE          :: f32(0.16)
+PHYSICS_LINK_STRENGTH          :: f32(0.010)
+PHYSICS_CENTER_GRAVITY         :: f32(0.0012)
+PHYSICS_DAMPING                :: f32(0.60)
+PHYSICS_MAX_SPEED              :: f32(0.035)
+PHYSICS_SETTLE_ENERGY          :: f32(0.0000005)
+PHYSICS_SETTLE_TIME_MS         :: f32(2000)
+PHYSICS_FULL_REPULSION_LIMIT   :: 900
+PHYSICS_REPULSION_SAMPLE_COUNT :: 700
+FOCUS_ANIMATION_SPEED          :: f32(14)
+
 Vertex :: struct {
 	x, y:       f32,
 	r, g, b, a: f32,
-	screen:      f32,
+	screen:     f32,
 }
 
 Push_Constants :: struct {
@@ -170,7 +181,7 @@ main :: proc() {
 	load_theme(g_theme_file)
 	ok: bool
 	g_graph, ok = load_graph(g_root)
-	if !ok { log.panicf("could not scan vault %q", g_root) }
+	if !ok {log.panicf("could not scan vault %q", g_root)}
 	rebuild_degrees()
 	rebuild_animation_state()
 	g_vertices = build_mesh(&g_graph, g_current)
@@ -190,12 +201,16 @@ main :: proc() {
 	glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
 	glfw.WindowHint(glfw.RESIZABLE, glfw.TRUE)
 
-	title := fmt.aprintf("Synapse — %d notes · %d links", len(g_graph.notes), len(g_graph.edges))
+	title := fmt.aprintf(
+		"Synapse — %d notes · %d links",
+		len(g_graph.notes),
+		len(g_graph.edges),
+	)
 	defer delete(title)
 	c_title := strings.clone_to_cstring(title)
 	g_window = glfw.CreateWindow(1100, 760, c_title, nil, nil)
 	delete(c_title)
-	if g_window == nil { log.panic("glfw: could not create a Vulkan window") }
+	if g_window == nil {log.panic("glfw: could not create a Vulkan window")}
 	defer glfw.DestroyWindow(g_window)
 	_, content_scale := glfw.GetWindowContentScale(g_window)
 	load_font(g_font_path, g_font_point_size * 96.0 / 72.0 * content_scale)
@@ -224,7 +239,10 @@ main :: proc() {
 		},
 	}
 
-	extensions := slice.clone_to_dynamic(glfw.GetRequiredInstanceExtensions(), context.temp_allocator)
+	extensions := slice.clone_to_dynamic(
+		glfw.GetRequiredInstanceExtensions(),
+		context.temp_allocator,
+	)
 
 	// MacOS is a special snowflake ;)
 	when ODIN_OS == .Darwin {
@@ -286,11 +304,16 @@ main :: proc() {
 	indices := find_queue_families(g_physical_device)
 	{
 		// TODO: this is kinda messy.
-		indices_set := make(map[u32]struct {}, allocator = context.temp_allocator)
+		indices_set := make(map[u32]struct{}, allocator = context.temp_allocator)
 		indices_set[indices.graphics.?] = {}
 		indices_set[indices.present.?] = {}
 
-		queue_create_infos := make([dynamic]vk.DeviceQueueCreateInfo, 0, len(indices_set), context.temp_allocator)
+		queue_create_infos := make(
+			[dynamic]vk.DeviceQueueCreateInfo,
+			0,
+			len(indices_set),
+			context.temp_allocator,
+		)
 		for family in indices_set {
 			append(
 				&queue_create_infos,
@@ -299,7 +322,7 @@ main :: proc() {
 					queueFamilyIndex = family,
 					queueCount = 1,
 					pQueuePriorities = raw_data([]f32{1}),
-				},// Scheduling priority between 0 and 1.
+				}, // Scheduling priority between 0 and 1.
 			)
 		}
 
@@ -407,21 +430,36 @@ main :: proc() {
 		}
 
 		binding := vk.VertexInputBindingDescription {
-			binding = 0,
-			stride = size_of(Vertex),
+			binding   = 0,
+			stride    = size_of(Vertex),
 			inputRate = .VERTEX,
 		}
 		attributes := [3]vk.VertexInputAttributeDescription {
-			{location = 0, binding = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, x))},
-			{location = 1, binding = 0, format = .R32G32B32A32_SFLOAT, offset = u32(offset_of(Vertex, r))},
-			{location = 2, binding = 0, format = .R32_SFLOAT, offset = u32(offset_of(Vertex, screen))},
+			{
+				location = 0,
+				binding = 0,
+				format = .R32G32_SFLOAT,
+				offset = u32(offset_of(Vertex, x)),
+			},
+			{
+				location = 1,
+				binding = 0,
+				format = .R32G32B32A32_SFLOAT,
+				offset = u32(offset_of(Vertex, r)),
+			},
+			{
+				location = 2,
+				binding = 0,
+				format = .R32_SFLOAT,
+				offset = u32(offset_of(Vertex, screen)),
+			},
 		}
 		vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
-			sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-			vertexBindingDescriptionCount = 1,
-			pVertexBindingDescriptions = &binding,
+			sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+			vertexBindingDescriptionCount   = 1,
+			pVertexBindingDescriptions      = &binding,
 			vertexAttributeDescriptionCount = 3,
-			pVertexAttributeDescriptions = &attributes[0],
+			pVertexAttributeDescriptions    = &attributes[0],
 		}
 
 		input_assembly := vk.PipelineInputAssemblyStateCreateInfo {
@@ -450,14 +488,14 @@ main :: proc() {
 		}
 
 		color_blend_attachment := vk.PipelineColorBlendAttachmentState {
-			blendEnable = true,
+			blendEnable         = true,
 			srcColorBlendFactor = .SRC_ALPHA,
 			dstColorBlendFactor = .ONE_MINUS_SRC_ALPHA,
-			colorBlendOp = .ADD,
+			colorBlendOp        = .ADD,
 			srcAlphaBlendFactor = .ONE,
 			dstAlphaBlendFactor = .ONE_MINUS_SRC_ALPHA,
-			alphaBlendOp = .ADD,
-			colorWriteMask = {.R, .G, .B, .A},
+			alphaBlendOp        = .ADD,
+			colorWriteMask      = {.R, .G, .B, .A},
 		}
 
 		color_blending := vk.PipelineColorBlendStateCreateInfo {
@@ -468,13 +506,13 @@ main :: proc() {
 
 		push_range := vk.PushConstantRange {
 			stageFlags = {.VERTEX},
-			offset = 0,
-			size = size_of(Push_Constants),
+			offset     = 0,
+			size       = size_of(Push_Constants),
 		}
 		pipeline_layout := vk.PipelineLayoutCreateInfo {
-			sType = .PIPELINE_LAYOUT_CREATE_INFO,
+			sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
 			pushConstantRangeCount = 1,
-			pPushConstantRanges = &push_range,
+			pPushConstantRanges    = &push_range,
 		}
 		must(vk.CreatePipelineLayout(g_device, &pipeline_layout, nil, &g_pipeline_layout))
 
@@ -542,8 +580,8 @@ main :: proc() {
 	for !glfw.WindowShouldClose(g_window) {
 		free_all(context.temp_allocator)
 
-		continuous := g_simulation_active || g_visual_animation_active ||
-		              g_dragged_node >= 0 || g_mesh_dirty
+		continuous :=
+			g_simulation_active || g_visual_animation_active || g_dragged_node >= 0 || g_mesh_dirty
 		if continuous {
 			glfw.PollEvents()
 		} else {
@@ -556,11 +594,11 @@ main :: proc() {
 		reload_theme_if_changed()
 
 		now := glfw.GetTime()
-		delta := f32(clamp(now-g_last_frame_time, 0.0, 0.05))
+		delta := f32(clamp(now - g_last_frame_time, 0.0, 0.05))
 		g_last_frame_time = now
 		animation_changed := update_graph_animation(delta)
 		should_render := animation_changed || g_mesh_dirty || g_framebuffer_resized
-		if !should_render { continue }
+		if !should_render {continue}
 
 		// With one frame in flight, this fence also makes the persistently mapped
 		// vertex buffer safe to update for animation without stalling the device.
@@ -618,7 +656,9 @@ main :: proc() {
 		}
 		present_result := vk.QueuePresentKHR(g_present_queue, &present_info)
 		switch {
-		case present_result == .ERROR_OUT_OF_DATE_KHR || present_result == .SUBOPTIMAL_KHR || g_framebuffer_resized:
+		case present_result == .ERROR_OUT_OF_DATE_KHR ||
+		     present_result == .SUBOPTIMAL_KHR ||
+		     g_framebuffer_resized:
 			g_framebuffer_resized = false
 			recreate_swapchain()
 		case present_result == .SUCCESS:
@@ -794,7 +834,12 @@ query_swapchain_support :: proc(
 		vk.GetPhysicalDeviceSurfaceFormatsKHR(device, g_surface, &count, nil) or_return
 
 		support.formats = make([]vk.SurfaceFormatKHR, count, allocator)
-		vk.GetPhysicalDeviceSurfaceFormatsKHR(device, g_surface, &count, raw_data(support.formats)) or_return
+		vk.GetPhysicalDeviceSurfaceFormatsKHR(
+			device,
+			g_surface,
+			&count,
+			raw_data(support.formats),
+		) or_return
 	}
 
 	{
@@ -802,7 +847,12 @@ query_swapchain_support :: proc(
 		vk.GetPhysicalDeviceSurfacePresentModesKHR(device, g_surface, &count, nil) or_return
 
 		support.presentModes = make([]vk.PresentModeKHR, count, allocator)
-		vk.GetPhysicalDeviceSurfacePresentModesKHR(device, g_surface, &count, raw_data(support.presentModes)) or_return
+		vk.GetPhysicalDeviceSurfacePresentModesKHR(
+			device,
+			g_surface,
+			&count,
+			raw_data(support.presentModes),
+		) or_return
 	}
 
 	return
@@ -837,12 +887,18 @@ choose_swapchain_extent :: proc(capabilities: vk.SurfaceCapabilitiesKHR) -> vk.E
 	}
 
 	width, height := glfw.GetFramebufferSize(g_window)
-	return(
-		vk.Extent2D {
-			width = clamp(u32(width), capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
-			height = clamp(u32(height), capabilities.minImageExtent.height, capabilities.maxImageExtent.height),
-		} \
-	)
+	return (vk.Extent2D {
+				width = clamp(
+					u32(width),
+					capabilities.minImageExtent.width,
+					capabilities.maxImageExtent.width,
+				),
+				height = clamp(
+					u32(height),
+					capabilities.minImageExtent.height,
+					capabilities.maxImageExtent.height,
+				),
+			})
 }
 
 glfw_error_callback :: proc "c" (code: i32, description: cstring) {
@@ -907,7 +963,8 @@ create_swapchain :: proc() {
 		g_swapchain_extent = extent
 
 		image_count := support.capabilities.minImageCount + 1
-		if support.capabilities.maxImageCount > 0 && image_count > support.capabilities.maxImageCount {
+		if support.capabilities.maxImageCount > 0 &&
+		   image_count > support.capabilities.maxImageCount {
 			image_count = support.capabilities.maxImageCount
 		}
 
@@ -929,7 +986,9 @@ create_swapchain :: proc() {
 		if indices.graphics != indices.present {
 			create_info.imageSharingMode = .CONCURRENT
 			create_info.queueFamilyIndexCount = 2
-			create_info.pQueueFamilyIndices = raw_data([]u32{indices.graphics.?, indices.present.?})
+			create_info.pQueueFamilyIndices = raw_data(
+				[]u32{indices.graphics.?, indices.present.?},
+			)
 		}
 
 		must(vk.CreateSwapchainKHR(g_device, &create_info, nil, &g_swapchain))
@@ -985,17 +1044,23 @@ create_framebuffers :: proc() {
 }
 
 destroy_framebuffers :: proc() {
-	for frame_buffer in g_swapchain_frame_buffers {vk.DestroyFramebuffer(g_device, frame_buffer, nil)}
+	for frame_buffer in g_swapchain_frame_buffers {vk.DestroyFramebuffer(
+			g_device,
+			frame_buffer,
+			nil,
+		)}
 	delete(g_swapchain_frame_buffers)
 }
 
 recreate_swapchain :: proc() {
 	// Don't do anything when minimized.
-	for w, h := glfw.GetFramebufferSize(g_window); w == 0 || h == 0; w, h = glfw.GetFramebufferSize(g_window) {
+	for w, h := glfw.GetFramebufferSize(g_window);
+	    w == 0 || h == 0;
+	    w, h = glfw.GetFramebufferSize(g_window) {
 		glfw.WaitEvents()
 
 		// Handle closing while minimized.
-		if glfw.WindowShouldClose(g_window) { break }
+		if glfw.WindowShouldClose(g_window) {break}
 	}
 
 	vk.DeviceWaitIdle(g_device)
@@ -1054,7 +1119,14 @@ record_command_buffer :: proc(command_buffer: vk.CommandBuffer, image_index: u32
 
 	aspect := f32(g_swapchain_extent.width) / f32(g_swapchain_extent.height)
 	push := Push_Constants{g_pan.x, g_pan.y, g_zoom, aspect}
-	vk.CmdPushConstants(command_buffer, g_pipeline_layout, {.VERTEX}, 0, size_of(Push_Constants), &push)
+	vk.CmdPushConstants(
+		command_buffer,
+		g_pipeline_layout,
+		{.VERTEX},
+		0,
+		size_of(Push_Constants),
+		&push,
+	)
 	offset: vk.DeviceSize
 	vk.CmdBindVertexBuffers(command_buffer, 0, 1, &g_vertex_buffer, &offset)
 	vk.CmdDraw(command_buffer, u32(len(g_vertices)), 1, 0, 0)
@@ -1070,21 +1142,22 @@ parse_arguments :: proc() -> (root, current, theme_file, font_path: string, font
 	for i := 1; i < len(os.args); i += 1 {
 		switch os.args[i] {
 		case "--root":
-			if i+1 < len(os.args) { i += 1; root = os.args[i] }
+			if i + 1 < len(os.args) {i += 1; root = os.args[i]}
 		case "--current":
-			if i+1 < len(os.args) { i += 1; current = normalize_id(os.args[i]) }
+			if i + 1 < len(os.args) {i += 1; current = normalize_id(os.args[i])}
 		case "--theme-file":
-			if i+1 < len(os.args) { i += 1; theme_file = os.args[i] }
+			if i + 1 < len(os.args) {i += 1; theme_file = os.args[i]}
 		case "--font":
-			if i+1 < len(os.args) { i += 1; font_path = os.args[i] }
+			if i + 1 < len(os.args) {i += 1; font_path = os.args[i]}
 		case "--font-size":
-			if i+1 < len(os.args) {
+			if i + 1 < len(os.args) {
 				i += 1
-				if parsed, parsed_ok := strconv.parse_f32(os.args[i]); parsed_ok { font_size = parsed }
+				if parsed, parsed_ok := strconv.parse_f32(os.args[i]);
+				   parsed_ok {font_size = parsed}
 			}
 		case:
 			// A positional path is convenient when running the renderer by hand.
-			if i == 1 { root = os.args[i] }
+			if i == 1 {root = os.args[i]}
 		}
 	}
 	return
@@ -1098,8 +1171,18 @@ append_colored_triangle :: proc(vertices: ^[dynamic]Vertex, a, b, c: Vertex) {
 	append(vertices, a, b, c)
 }
 
-append_triangle :: proc(vertices: ^[dynamic]Vertex, a, b, c: Vec2, color: [4]f32, screen: f32 = 0) {
-	append_colored_triangle(vertices, vertex(a, color, screen), vertex(b, color, screen), vertex(c, color, screen))
+append_triangle :: proc(
+	vertices: ^[dynamic]Vertex,
+	a, b, c: Vec2,
+	color: [4]f32,
+	screen: f32 = 0,
+) {
+	append_colored_triangle(
+		vertices,
+		vertex(a, color, screen),
+		vertex(b, color, screen),
+		vertex(c, color, screen),
+	)
 }
 
 with_alpha :: proc(color: [4]f32, alpha: f32) -> [4]f32 {
@@ -1110,10 +1193,10 @@ with_alpha :: proc(color: [4]f32, alpha: f32) -> [4]f32 {
 
 mix_color :: proc(a, b: [4]f32, amount: f32) -> [4]f32 {
 	return {
-		a[0] + (b[0]-a[0])*amount,
-		a[1] + (b[1]-a[1])*amount,
-		a[2] + (b[2]-a[2])*amount,
-		a[3] + (b[3]-a[3])*amount,
+		a[0] + (b[0] - a[0]) * amount,
+		a[1] + (b[1] - a[1]) * amount,
+		a[2] + (b[2] - a[2]) * amount,
+		a[3] + (b[3] - a[3]) * amount,
 	}
 }
 
@@ -1137,24 +1220,23 @@ rebuild_animation_state :: proc() {
 	g_node_scales = make([]f32, len(g_graph.notes))
 	g_node_focus = make([]f32, len(g_graph.notes))
 	g_edge_focus = make([]f32, len(g_graph.edges))
-	for &scale in g_node_scales { scale = 1 }
+	for &scale in g_node_scales {scale = 1}
 	g_hover_presence = 0
 	g_dragged_node = -1
 	g_simulation_active = true
 	g_visual_animation_active = false
-	g_simulation_frames = 0
-	g_stable_frames = 0
+	g_stable_time_ms = 0
 }
 
 update_graph_animation :: proc(delta: f32) -> bool {
-	if delta <= 0 { return false }
+	if delta <= 0 {return false}
 	changed := false
 	visual_changed := false
-	blend := min(1.0, delta*14)
+	blend := min(1.0, delta * FOCUS_ANIMATION_SPEED)
 	hover_target: f32 = g_last_hovered >= 0 ? 1 : 0
 	old_hover := g_hover_presence
-	g_hover_presence += (hover_target-g_hover_presence)*blend
-	if abs(g_hover_presence-old_hover) > 0.0001 { changed = true; visual_changed = true }
+	g_hover_presence += (hover_target - g_hover_presence) * blend
+	if abs(g_hover_presence - old_hover) > 0.0001 {changed = true; visual_changed = true}
 
 	target_focus := make([]f32, len(g_graph.notes), context.temp_allocator)
 	if g_last_hovered >= 0 && g_last_hovered < len(g_graph.notes) {
@@ -1169,60 +1251,62 @@ update_graph_animation :: proc(delta: f32) -> bool {
 				edge_target = 1
 			}
 			old := g_edge_focus[edge_index]
-			g_edge_focus[edge_index] += (edge_target-old)*blend
-			if abs(g_edge_focus[edge_index]-old) > 0.0001 { changed = true; visual_changed = true }
+			g_edge_focus[edge_index] += (edge_target - old) * blend
+			if abs(g_edge_focus[edge_index] - old) > 0.0001 {changed = true; visual_changed = true}
 		}
 	} else {
 		for &focus in g_edge_focus {
 			old := focus
-			focus += (0-focus)*blend
-			if abs(focus-old) > 0.0001 { changed = true; visual_changed = true }
+			focus += (0 - focus) * blend
+			if abs(focus - old) > 0.0001 {changed = true; visual_changed = true}
 		}
 	}
-	for i in 0..<len(g_graph.notes) {
+	for i in 0 ..< len(g_graph.notes) {
 		old_focus := g_node_focus[i]
-		g_node_focus[i] += (target_focus[i]-old_focus)*blend
-		target_scale := 1.0 + target_focus[i]*0.7
-		if target_focus[i] > 0 && target_focus[i] < 1 { target_scale = 1.15 }
+		g_node_focus[i] += (target_focus[i] - old_focus) * blend
+		target_scale := 1.0 + target_focus[i] * 0.7
+		if target_focus[i] > 0 && target_focus[i] < 1 {target_scale = 1.15}
 		old_scale := g_node_scales[i]
-		g_node_scales[i] += (target_scale-old_scale)*blend
-		if abs(g_node_focus[i]-old_focus) > 0.0001 || abs(g_node_scales[i]-old_scale) > 0.0001 {
+		g_node_scales[i] += (target_scale - old_scale) * blend
+		if abs(g_node_focus[i] - old_focus) > 0.0001 ||
+		   abs(g_node_scales[i] - old_scale) > 0.0001 {
 			changed = true
 			visual_changed = true
 		}
 	}
 	g_visual_animation_active = visual_changed
 
-	if !g_simulation_active { return changed }
-	g_simulation_frames += 1
-	frame_scale := delta*60
+	if !g_simulation_active {return changed}
+	frame_scale := delta * PHYSICS_REFERENCE_FPS
 	n := len(g_graph.notes)
 	stride := 1
-	if n > 900 { stride = max(1, n/700) }
-	for i in 0..<n {
-		for j := i+1; j < n; j += stride {
-			dx := g_graph.notes[i].pos.x-g_graph.notes[j].pos.x
-			dy := g_graph.notes[i].pos.y-g_graph.notes[j].pos.y
-			distance_squared := dx*dx+dy*dy+0.0015
-			force := 0.00012/distance_squared*frame_scale
-			g_graph.notes[i].vel.x += dx*force
-			g_graph.notes[i].vel.y += dy*force
-			g_graph.notes[j].vel.x -= dx*force
-			g_graph.notes[j].vel.y -= dy*force
+	if n > PHYSICS_FULL_REPULSION_LIMIT {
+		stride = max(1, n / PHYSICS_REPULSION_SAMPLE_COUNT)
+	}
+	for i in 0 ..< n {
+		for j := i + 1; j < n; j += stride {
+			dx := g_graph.notes[i].pos.x - g_graph.notes[j].pos.x
+			dy := g_graph.notes[i].pos.y - g_graph.notes[j].pos.y
+			distance_squared := dx * dx + dy * dy + PHYSICS_REPULSION_SOFTENING
+			force := PHYSICS_REPULSION / distance_squared * frame_scale
+			g_graph.notes[i].vel.x += dx * force
+			g_graph.notes[i].vel.y += dy * force
+			g_graph.notes[j].vel.x -= dx * force
+			g_graph.notes[j].vel.y -= dy * force
 		}
 	}
 	for edge in g_graph.edges {
 		a, b := &g_graph.notes[edge.from], &g_graph.notes[edge.to]
-		dx, dy := b.pos.x-a.pos.x, b.pos.y-a.pos.y
-		distance := math.sqrt(dx*dx+dy*dy+0.0001)
-		force := (distance-0.16)*0.010*frame_scale
-		x, y := dx/distance*force, dy/distance*force
+		dx, dy := b.pos.x - a.pos.x, b.pos.y - a.pos.y
+		distance := math.sqrt(dx * dx + dy * dy + 0.0001)
+		force := (distance - PHYSICS_LINK_DISTANCE) * PHYSICS_LINK_STRENGTH * frame_scale
+		x, y := dx / distance * force, dy / distance * force
 		a.vel.x += x; a.vel.y += y
 		b.vel.x -= x; b.vel.y -= y
 	}
 
 	energy: f32
-	damping := math.pow(0.82, frame_scale)
+	damping := math.pow(PHYSICS_DAMPING, frame_scale)
 	for &note, i in g_graph.notes {
 		if i == g_dragged_node {
 			note.vel = {}
@@ -1230,25 +1314,25 @@ update_graph_animation :: proc(delta: f32) -> bool {
 		}
 		// Center gravity keeps disconnected clusters in the same field, matching
 		// Obsidian's continuously settling graph rather than a one-shot layout.
-		note.vel.x += -note.pos.x*0.0012*frame_scale
-		note.vel.y += -note.pos.y*0.0012*frame_scale
-		note.vel.x = clamp(note.vel.x*damping, -0.035, 0.035)
-		note.vel.y = clamp(note.vel.y*damping, -0.035, 0.035)
-		note.pos.x += note.vel.x*frame_scale
-		note.pos.y += note.vel.y*frame_scale
-		energy += note.vel.x*note.vel.x+note.vel.y*note.vel.y
+		note.vel.x += -note.pos.x * PHYSICS_CENTER_GRAVITY * frame_scale
+		note.vel.y += -note.pos.y * PHYSICS_CENTER_GRAVITY * frame_scale
+		note.vel.x = clamp(note.vel.x * damping, -PHYSICS_MAX_SPEED, PHYSICS_MAX_SPEED)
+		note.vel.y = clamp(note.vel.y * damping, -PHYSICS_MAX_SPEED, PHYSICS_MAX_SPEED)
+		note.pos.x += note.vel.x * frame_scale
+		note.pos.y += note.vel.y * frame_scale
+		energy += note.vel.x * note.vel.x + note.vel.y * note.vel.y
 	}
 	changed = true
-	if energy < 0.000005 && g_dragged_node < 0 {
-		g_stable_frames += 1
+	if energy < PHYSICS_SETTLE_ENERGY {
+		g_stable_time_ms += delta * 1000
 	} else {
-		g_stable_frames = 0
+		g_stable_time_ms = 0
 	}
 	// Stop tiny perpetual oscillations. Interaction or a graph reload starts the
 	// solver again, so an idle window consumes no continuous CPU/GPU time.
-	if g_stable_frames > 45 || (g_simulation_frames > 480 && g_dragged_node < 0) {
+	if g_stable_time_ms >= PHYSICS_SETTLE_TIME_MS {
 		g_simulation_active = false
-		for &note in g_graph.notes { note.vel = {} }
+		for &note in g_graph.notes {note.vel = {}}
 	}
 	return changed
 }
@@ -1259,24 +1343,44 @@ append_antialiased_link :: proc(
 	color: [4]f32,
 	width: f32,
 ) {
-	dx, dy := b.x-a.x, b.y-a.y
-	length := math.sqrt(dx*dx + dy*dy)
-	if length < 0.0001 { return }
+	dx, dy := b.x - a.x, b.y - a.y
+	length := math.sqrt(dx * dx + dy * dy)
+	if length < 0.0001 {return}
 	feather: f32 = 0.0018
-	inner := Vec2{-dy/length*width, dx/length*width}
-	outer := Vec2{-dy/length*(width+feather), dx/length*(width+feather)}
-	ai, bi := Vec2{a.x+inner.x,a.y+inner.y}, Vec2{b.x+inner.x,b.y+inner.y}
-	ci, di := Vec2{a.x-inner.x,a.y-inner.y}, Vec2{b.x-inner.x,b.y-inner.y}
-	ao, bo := Vec2{a.x+outer.x,a.y+outer.y}, Vec2{b.x+outer.x,b.y+outer.y}
-	co, d_outer := Vec2{a.x-outer.x,a.y-outer.y}, Vec2{b.x-outer.x,b.y-outer.y}
+	inner := Vec2{-dy / length * width, dx / length * width}
+	outer := Vec2{-dy / length * (width + feather), dx / length * (width + feather)}
+	ai, bi := Vec2{a.x + inner.x, a.y + inner.y}, Vec2{b.x + inner.x, b.y + inner.y}
+	ci, di := Vec2{a.x - inner.x, a.y - inner.y}, Vec2{b.x - inner.x, b.y - inner.y}
+	ao, bo := Vec2{a.x + outer.x, a.y + outer.y}, Vec2{b.x + outer.x, b.y + outer.y}
+	co, d_outer := Vec2{a.x - outer.x, a.y - outer.y}, Vec2{b.x - outer.x, b.y - outer.y}
 	transparent := with_alpha(color, 0)
 
 	append_triangle(vertices, ai, ci, bi, color)
 	append_triangle(vertices, bi, ci, di, color)
-	append_colored_triangle(vertices, vertex(ao, transparent), vertex(ai, color), vertex(bo, transparent))
-	append_colored_triangle(vertices, vertex(bo, transparent), vertex(ai, color), vertex(bi, color))
-	append_colored_triangle(vertices, vertex(ci, color), vertex(co, transparent), vertex(di, color))
-	append_colored_triangle(vertices, vertex(di, color), vertex(co, transparent), vertex(d_outer, transparent))
+	append_colored_triangle(
+		vertices,
+		vertex(ao, transparent),
+		vertex(ai, color),
+		vertex(bo, transparent),
+	)
+	append_colored_triangle(
+		vertices,
+		vertex(bo, transparent),
+		vertex(ai, color),
+		vertex(bi, color),
+	)
+	append_colored_triangle(
+		vertices,
+		vertex(ci, color),
+		vertex(co, transparent),
+		vertex(di, color),
+	)
+	append_colored_triangle(
+		vertices,
+		vertex(di, color),
+		vertex(co, transparent),
+		vertex(d_outer, transparent),
+	)
 }
 
 append_antialiased_node :: proc(
@@ -1288,28 +1392,44 @@ append_antialiased_node :: proc(
 	segments := 28
 	outer_radius := radius + 0.0022
 	transparent := with_alpha(color, 0)
-	for segment in 0..<segments {
-		a0 := f32(segment) / f32(segments) * 2*math.PI
-		a1 := f32(segment+1) / f32(segments) * 2*math.PI
-		i0 := Vec2{center.x + math.cos(a0)*radius, center.y + math.sin(a0)*radius}
-		i1 := Vec2{center.x + math.cos(a1)*radius, center.y + math.sin(a1)*radius}
-		o0 := Vec2{center.x + math.cos(a0)*outer_radius, center.y + math.sin(a0)*outer_radius}
-		o1 := Vec2{center.x + math.cos(a1)*outer_radius, center.y + math.sin(a1)*outer_radius}
+	for segment in 0 ..< segments {
+		a0 := f32(segment) / f32(segments) * 2 * math.PI
+		a1 := f32(segment + 1) / f32(segments) * 2 * math.PI
+		i0 := Vec2{center.x + math.cos(a0) * radius, center.y + math.sin(a0) * radius}
+		i1 := Vec2{center.x + math.cos(a1) * radius, center.y + math.sin(a1) * radius}
+		o0 := Vec2{center.x + math.cos(a0) * outer_radius, center.y + math.sin(a0) * outer_radius}
+		o1 := Vec2{center.x + math.cos(a1) * outer_radius, center.y + math.sin(a1) * outer_radius}
 		append_triangle(vertices, center, i0, i1, color)
-		append_colored_triangle(vertices, vertex(i0, color), vertex(o0, transparent), vertex(i1, color))
-		append_colored_triangle(vertices, vertex(i1, color), vertex(o0, transparent), vertex(o1, transparent))
+		append_colored_triangle(
+			vertices,
+			vertex(i0, color),
+			vertex(o0, transparent),
+			vertex(i1, color),
+		)
+		append_colored_triangle(
+			vertices,
+			vertex(i1, color),
+			vertex(o0, transparent),
+			vertex(o1, transparent),
+		)
 	}
 }
 
 load_font :: proc(path: string, pixel_height: f32) {
-	if len(path) == 0 { return }
-	g_font_bitmap = make([]byte, FONT_ATLAS_WIDTH*FONT_ATLAS_HEIGHT)
+	if len(path) == 0 {return}
+	g_font_bitmap = make([]byte, FONT_ATLAS_WIDTH * FONT_ATLAS_HEIGHT)
 	g_font_pixel_height = max(pixel_height, 8)
 	c_path := strings.clone_to_cstring(path)
 	result := synapse_bake_font(
-		c_path, g_font_pixel_height,
-		raw_data(g_font_bitmap), FONT_ATLAS_WIDTH, FONT_ATLAS_HEIGHT,
-		FONT_FIRST, FONT_LAST-FONT_FIRST+1, &g_font_chars[0], &g_font_ascent,
+		c_path,
+		g_font_pixel_height,
+		raw_data(g_font_bitmap),
+		FONT_ATLAS_WIDTH,
+		FONT_ATLAS_HEIGHT,
+		FONT_FIRST,
+		FONT_LAST - FONT_FIRST + 1,
+		&g_font_chars[0],
+		&g_font_ascent,
 	)
 	delete(c_path)
 	if result == 0 {
@@ -1324,116 +1444,162 @@ load_font :: proc(path: string, pixel_height: f32) {
 
 glyph_rows :: proc(character: byte) -> [7]u8 {
 	c := character
-	if c >= 'a' && c <= 'z' { c -= 'a'-'A' }
+	if c >= 'a' && c <= 'z' {c -= 'a' - 'A'}
 	switch c {
-	case 'A': return {14,17,17,31,17,17,17}
-	case 'B': return {30,17,17,30,17,17,30}
-	case 'C': return {14,17,16,16,16,17,14}
-	case 'D': return {30,17,17,17,17,17,30}
-	case 'E': return {31,16,16,30,16,16,31}
-	case 'F': return {31,16,16,30,16,16,16}
-	case 'G': return {14,17,16,23,17,17,15}
-	case 'H': return {17,17,17,31,17,17,17}
-	case 'I': return {14,4,4,4,4,4,14}
-	case 'J': return {7,2,2,2,18,18,12}
-	case 'K': return {17,18,20,24,20,18,17}
-	case 'L': return {16,16,16,16,16,16,31}
-	case 'M': return {17,27,21,21,17,17,17}
-	case 'N': return {17,25,21,19,17,17,17}
-	case 'O': return {14,17,17,17,17,17,14}
-	case 'P': return {30,17,17,30,16,16,16}
-	case 'Q': return {14,17,17,17,21,18,13}
-	case 'R': return {30,17,17,30,20,18,17}
-	case 'S': return {15,16,16,14,1,1,30}
-	case 'T': return {31,4,4,4,4,4,4}
-	case 'U': return {17,17,17,17,17,17,14}
-	case 'V': return {17,17,17,17,17,10,4}
-	case 'W': return {17,17,17,21,21,21,10}
-	case 'X': return {17,17,10,4,10,17,17}
-	case 'Y': return {17,17,10,4,4,4,4}
-	case 'Z': return {31,1,2,4,8,16,31}
-	case '0': return {14,17,19,21,25,17,14}
-	case '1': return {4,12,4,4,4,4,14}
-	case '2': return {14,17,1,2,4,8,31}
-	case '3': return {30,1,1,14,1,1,30}
-	case '4': return {2,6,10,18,31,2,2}
-	case '5': return {31,16,16,30,1,1,30}
-	case '6': return {14,16,16,30,17,17,14}
-	case '7': return {31,1,2,4,8,8,8}
-	case '8': return {14,17,17,14,17,17,14}
-	case '9': return {14,17,17,15,1,1,14}
-	case '-': return {0,0,0,31,0,0,0}
-	case '_': return {0,0,0,0,0,0,31}
-	case '/': return {1,2,2,4,8,8,16}
-	case '.': return {0,0,0,0,0,12,12}
-	case ':': return {0,12,12,0,12,12,0}
-	case '?': return {14,17,1,2,4,0,4}
-	case ' ': return {}
+	case 'A':
+		return {14, 17, 17, 31, 17, 17, 17}
+	case 'B':
+		return {30, 17, 17, 30, 17, 17, 30}
+	case 'C':
+		return {14, 17, 16, 16, 16, 17, 14}
+	case 'D':
+		return {30, 17, 17, 17, 17, 17, 30}
+	case 'E':
+		return {31, 16, 16, 30, 16, 16, 31}
+	case 'F':
+		return {31, 16, 16, 30, 16, 16, 16}
+	case 'G':
+		return {14, 17, 16, 23, 17, 17, 15}
+	case 'H':
+		return {17, 17, 17, 31, 17, 17, 17}
+	case 'I':
+		return {14, 4, 4, 4, 4, 4, 14}
+	case 'J':
+		return {7, 2, 2, 2, 18, 18, 12}
+	case 'K':
+		return {17, 18, 20, 24, 20, 18, 17}
+	case 'L':
+		return {16, 16, 16, 16, 16, 16, 31}
+	case 'M':
+		return {17, 27, 21, 21, 17, 17, 17}
+	case 'N':
+		return {17, 25, 21, 19, 17, 17, 17}
+	case 'O':
+		return {14, 17, 17, 17, 17, 17, 14}
+	case 'P':
+		return {30, 17, 17, 30, 16, 16, 16}
+	case 'Q':
+		return {14, 17, 17, 17, 21, 18, 13}
+	case 'R':
+		return {30, 17, 17, 30, 20, 18, 17}
+	case 'S':
+		return {15, 16, 16, 14, 1, 1, 30}
+	case 'T':
+		return {31, 4, 4, 4, 4, 4, 4}
+	case 'U':
+		return {17, 17, 17, 17, 17, 17, 14}
+	case 'V':
+		return {17, 17, 17, 17, 17, 10, 4}
+	case 'W':
+		return {17, 17, 17, 21, 21, 21, 10}
+	case 'X':
+		return {17, 17, 10, 4, 10, 17, 17}
+	case 'Y':
+		return {17, 17, 10, 4, 4, 4, 4}
+	case 'Z':
+		return {31, 1, 2, 4, 8, 16, 31}
+	case '0':
+		return {14, 17, 19, 21, 25, 17, 14}
+	case '1':
+		return {4, 12, 4, 4, 4, 4, 14}
+	case '2':
+		return {14, 17, 1, 2, 4, 8, 31}
+	case '3':
+		return {30, 1, 1, 14, 1, 1, 30}
+	case '4':
+		return {2, 6, 10, 18, 31, 2, 2}
+	case '5':
+		return {31, 16, 16, 30, 1, 1, 30}
+	case '6':
+		return {14, 16, 16, 30, 17, 17, 14}
+	case '7':
+		return {31, 1, 2, 4, 8, 8, 8}
+	case '8':
+		return {14, 17, 17, 14, 17, 17, 14}
+	case '9':
+		return {14, 17, 17, 15, 1, 1, 14}
+	case '-':
+		return {0, 0, 0, 31, 0, 0, 0}
+	case '_':
+		return {0, 0, 0, 0, 0, 0, 31}
+	case '/':
+		return {1, 2, 2, 4, 8, 8, 16}
+	case '.':
+		return {0, 0, 0, 0, 0, 12, 12}
+	case ':':
+		return {0, 12, 12, 0, 12, 12, 0}
+	case '?':
+		return {14, 17, 1, 2, 4, 0, 4}
+	case ' ':
+		return {}
 	}
-	return {14,17,1,2,4,0,4}
+	return {14, 17, 1, 2, 4, 0, 4}
 }
 
 append_screen_rect :: proc(vertices: ^[dynamic]Vertex, min, max: Vec2, color: [4]f32) {
-	append_triangle(vertices, min, {max.x,min.y}, {min.x,max.y}, color, 1)
-	append_triangle(vertices, {min.x,max.y}, {max.x,min.y}, max, color, 1)
+	append_triangle(vertices, min, {max.x, min.y}, {min.x, max.y}, color, 1)
+	append_triangle(vertices, {min.x, max.y}, {max.x, min.y}, max, color, 1)
 }
 
 font_character_index :: proc(codepoint: rune) -> int {
 	value := codepoint
-	if value < FONT_FIRST || value > FONT_LAST { value = '?' }
-	return int(value)-FONT_FIRST
+	if value < FONT_FIRST || value > FONT_LAST {value = '?'}
+	return int(value) - FONT_FIRST
 }
 
 append_hover_label :: proc(vertices: ^[dynamic]Vertex, title: string, center: Vec2, radius: f32) {
-	if !g_font_ready { return }
+	if !g_font_ready {return}
 	frame_width, frame_height := glfw.GetFramebufferSize(g_window)
-	if frame_width <= 0 || frame_height <= 0 { return }
+	if frame_width <= 0 || frame_height <= 0 {return}
 
 	width_pixels: f32
 	character_count := 0
 	for codepoint in title {
-		if character_count >= 48 { break }
+		if character_count >= 48 {break}
 		width_pixels += g_font_chars[font_character_index(codepoint)].advance
 		character_count += 1
 	}
-	if character_count == 0 { return }
+	if character_count == 0 {return}
 
-	aspect := f32(frame_width)/f32(frame_height)
-	center_ndc := Vec2{
-		(center.x+g_pan.x)*g_zoom/aspect,
-		(center.y+g_pan.y)*g_zoom,
-	}
-	text_width_ndc := width_pixels*2/f32(frame_width)
-	left := clamp(center_ndc.x-text_width_ndc/2, -0.97, 0.97-text_width_ndc)
-	text_height_ndc := g_font_pixel_height*2/f32(frame_height)
-	top := center_ndc.y + radius*g_zoom + 10/f32(frame_height)
-	if top+text_height_ndc > 0.97 { top = 0.97-text_height_ndc }
+	aspect := f32(frame_width) / f32(frame_height)
+	center_ndc := Vec2{(center.x + g_pan.x) * g_zoom / aspect, (center.y + g_pan.y) * g_zoom}
+	text_width_ndc := width_pixels * 2 / f32(frame_width)
+	left := clamp(center_ndc.x - text_width_ndc / 2, -0.97, 0.97 - text_width_ndc)
+	text_height_ndc := g_font_pixel_height * 2 / f32(frame_height)
+	top := center_ndc.y + radius * g_zoom + 10 / f32(frame_height)
+	if top + text_height_ndc > 0.97 {top = 0.97 - text_height_ndc}
 
-	padding_x := 5/f32(frame_width)
-	padding_y := 4/f32(frame_height)
+	padding_x := 5 / f32(frame_width)
+	padding_y := 4 / f32(frame_height)
 	append_screen_rect(
 		vertices,
-		{left-padding_x, top-padding_y},
-		{left+text_width_ndc+padding_x, top+text_height_ndc+padding_y},
+		{left - padding_x, top - padding_y},
+		{left + text_width_ndc + padding_x, top + text_height_ndc + padding_y},
 		with_alpha(g_background, 0.90),
 	)
 
 	cursor_x: f32
 	drawn := 0
 	for codepoint in title {
-		if drawn >= 48 { break }
+		if drawn >= 48 {break}
 		glyph := g_font_chars[font_character_index(codepoint)]
-		glyph_left := cursor_x+f32(glyph.bearing_x)
-		glyph_top := g_font_ascent-f32(glyph.bearing_y)
-		for row in 0..<int(glyph.height) {
-			for column in 0..<int(glyph.width) {
-				coverage := g_font_bitmap[(int(glyph.y)+row)*FONT_ATLAS_WIDTH+int(glyph.x)+column]
-				if coverage < 8 { continue }
-				x0 := left + (glyph_left+f32(column))*2/f32(frame_width)
-				y0 := top + (glyph_top+f32(row))*2/f32(frame_height)
-				x1 := x0 + 2/f32(frame_width)
-				y1 := y0 + 2/f32(frame_height)
-				append_screen_rect(vertices, {x0,y0}, {x1,y1}, with_alpha(g_text_color, f32(coverage)/255))
+		glyph_left := cursor_x + f32(glyph.bearing_x)
+		glyph_top := g_font_ascent - f32(glyph.bearing_y)
+		for row in 0 ..< int(glyph.height) {
+			for column in 0 ..< int(glyph.width) {
+				coverage :=
+					g_font_bitmap[(int(glyph.y) + row) * FONT_ATLAS_WIDTH + int(glyph.x) + column]
+				if coverage < 8 {continue}
+				x0 := left + (glyph_left + f32(column)) * 2 / f32(frame_width)
+				y0 := top + (glyph_top + f32(row)) * 2 / f32(frame_height)
+				x1 := x0 + 2 / f32(frame_width)
+				y1 := y0 + 2 / f32(frame_height)
+				append_screen_rect(
+					vertices,
+					{x0, y0},
+					{x1, y1},
+					with_alpha(g_text_color, f32(coverage) / 255),
+				)
 			}
 		}
 		cursor_x += glyph.advance
@@ -1442,7 +1608,7 @@ append_hover_label :: proc(vertices: ^[dynamic]Vertex, title: string, center: Ve
 }
 
 build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
-	vertices := make([dynamic]Vertex, 0, len(graph.edges)*24 + len(graph.notes)*252)
+	vertices := make([dynamic]Vertex, 0, len(graph.edges) * 24 + len(graph.notes) * 252)
 
 	for edge, edge_index in graph.edges {
 		a, b := graph.notes[edge.from].pos, graph.notes[edge.to].pos
@@ -1450,29 +1616,29 @@ build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
 		color := is_ghost ? with_alpha(g_ghost_color, 0.65) : g_edge_color
 		focus := g_edge_focus[edge_index]
 		color = mix_color(color, with_alpha(g_highlight_color, 0.9), focus)
-		color = with_alpha(color, 1.0-g_hover_presence*(1.0-focus)*0.72)
-		width := 0.0018+(0.0032-0.0018)*focus
+		color = with_alpha(color, 1.0 - g_hover_presence * (1.0 - focus) * 0.72)
+		width := 0.0018 + (0.0032 - 0.0018) * focus
 		append_antialiased_link(&vertices, a, b, color, width)
 	}
 
 	for note, i in graph.notes {
-		radius := node_radius(g_degrees[i])*g_node_scales[i]
+		radius := node_radius(g_degrees[i]) * g_node_scales[i]
 		color := g_node_color
 		if !note.exists {
 			color = g_ghost_color
 		} else if g_degrees[i] == 0 {
 			color = g_muted_color
 		}
-		if len(current) > 0 && note.id == current { color = g_highlight_color }
+		if len(current) > 0 && note.id == current {color = g_highlight_color}
 		focus := g_node_focus[i]
 		color = mix_color(color, g_highlight_color, focus)
-		color = with_alpha(color, 1.0-g_hover_presence*(1.0-focus)*0.52)
+		color = with_alpha(color, 1.0 - g_hover_presence * (1.0 - focus) * 0.52)
 		append_antialiased_node(&vertices, note.pos, radius, color)
 	}
 
 	if g_last_hovered >= 0 && g_last_hovered < len(graph.notes) {
 		hovered := graph.notes[g_last_hovered]
-		radius := node_radius(g_degrees[g_last_hovered])*g_node_scales[g_last_hovered]
+		radius := node_radius(g_degrees[g_last_hovered]) * g_node_scales[g_last_hovered]
 		append_hover_label(&vertices, hovered.title, hovered.pos, radius)
 	}
 	return vertices
@@ -1507,63 +1673,75 @@ destroy_vertex_buffer :: proc() {
 
 hex_digit :: proc(value: byte) -> (u8, bool) {
 	switch value {
-	case '0'..='9': return value-'0', true
-	case 'a'..='f': return value-'a'+10, true
-	case 'A'..='F': return value-'A'+10, true
+	case '0' ..= '9':
+		return value - '0', true
+	case 'a' ..= 'f':
+		return value - 'a' + 10, true
+	case 'A' ..= 'F':
+		return value - 'A' + 10, true
 	}
 	return 0, false
 }
 
 srgb_to_linear :: proc(value: f32) -> f32 {
-	if value <= 0.04045 { return value / 12.92 }
+	if value <= 0.04045 {return value / 12.92}
 	return math.pow((value + 0.055) / 1.055, 2.4)
 }
 
 parse_hex_color :: proc(text: string, alpha: f32 = 1.0) -> (color: [4]f32, ok: bool) {
 	value := strings.trim_space(text)
-	if strings.has_prefix(value, "#") { value = value[1:] }
-	if len(value) != 6 { return }
+	if strings.has_prefix(value, "#") {value = value[1:]}
+	if len(value) != 6 {return}
 	values: [3]u8
-	for channel in 0..<3 {
-		hi, hi_ok := hex_digit(value[channel*2])
-		lo, lo_ok := hex_digit(value[channel*2+1])
-		if !hi_ok || !lo_ok { return }
-		values[channel] = hi*16+lo
+	for channel in 0 ..< 3 {
+		hi, hi_ok := hex_digit(value[channel * 2])
+		lo, lo_ok := hex_digit(value[channel * 2 + 1])
+		if !hi_ok || !lo_ok {return}
+		values[channel] = hi * 16 + lo
 	}
 	color = {
-		srgb_to_linear(f32(values[0])/255),
-		srgb_to_linear(f32(values[1])/255),
-		srgb_to_linear(f32(values[2])/255),
+		srgb_to_linear(f32(values[0]) / 255),
+		srgb_to_linear(f32(values[1]) / 255),
+		srgb_to_linear(f32(values[2]) / 255),
 		alpha,
 	}
 	return color, true
 }
 
 load_theme :: proc(path: string) -> bool {
-	if len(path) == 0 { return false }
+	if len(path) == 0 {return false}
 	data, err := os.read_entire_file(path, context.temp_allocator)
-	if err != nil { return false }
-	colors := [7][4]f32{
-		g_background, g_text_color, g_node_color, g_edge_color,
-		g_muted_color, g_highlight_color, g_ghost_color,
+	if err != nil {return false}
+	colors := [7][4]f32 {
+		g_background,
+		g_text_color,
+		g_node_color,
+		g_edge_color,
+		g_muted_color,
+		g_highlight_color,
+		g_ghost_color,
 	}
 	text := string(data)
 	count := 0
 	for line in strings.split_lines_iterator(&text) {
-		if count >= len(colors) { break }
+		if count >= len(colors) {break}
 		alpha: f32 = 1
-		if count == 3 { alpha = 0.42 }
-		if count == 6 { alpha = 0.82 }
+		if count == 3 {alpha = 0.42}
+		if count == 6 {alpha = 0.82}
 		color, ok := parse_hex_color(line, alpha)
-		if !ok { return false }
+		if !ok {return false}
 		colors[count] = color
 		count += 1
 	}
-	if count != len(colors) { return false }
-	changed := colors[0] != g_background || colors[1] != g_text_color ||
-	           colors[2] != g_node_color || colors[3] != g_edge_color ||
-	           colors[4] != g_muted_color || colors[5] != g_highlight_color ||
-	           colors[6] != g_ghost_color
+	if count != len(colors) {return false}
+	changed :=
+		colors[0] != g_background ||
+		colors[1] != g_text_color ||
+		colors[2] != g_node_color ||
+		colors[3] != g_edge_color ||
+		colors[4] != g_muted_color ||
+		colors[5] != g_highlight_color ||
+		colors[6] != g_ghost_color
 	g_background = colors[0]
 	g_text_color = colors[1]
 	g_node_color = colors[2]
@@ -1583,19 +1761,19 @@ replace_vertex_data :: proc(vertices: [dynamic]Vertex) {
 }
 
 upload_vertex_data :: proc(vertices: [dynamic]Vertex) {
-	size := vk.DeviceSize(len(vertices)*size_of(Vertex))
+	size := vk.DeviceSize(len(vertices) * size_of(Vertex))
 	if size > g_vertex_capacity {
 		replace_vertex_data(vertices)
 		return
 	}
 	delete(g_vertices)
 	g_vertices = vertices
-	if size > 0 { mem.copy(g_vertex_mapped, raw_data(g_vertices), int(size)) }
+	if size > 0 {mem.copy(g_vertex_mapped, raw_data(g_vertices), int(size))}
 }
 
 reload_theme_if_changed :: proc() {
 	now := glfw.GetTime()
-	if now < g_next_theme_scan { return }
+	if now < g_next_theme_scan {return}
 	g_next_theme_scan = now + (g_simulation_active ? 0.5 : 1.0)
 	if load_theme(g_theme_file) {
 		g_mesh_dirty = true
@@ -1613,7 +1791,7 @@ vault_fingerprint :: proc(root: string) -> u64 {
 			os.walker_skip_dir(&walker)
 			continue
 		}
-		if info.type != .Regular || !is_markdown_file_name(info.name) { continue }
+		if info.type != .Regular || !is_markdown_file_name(info.name) {continue}
 		modified := u64(time.to_unix_nanoseconds(info.modification_time))
 		file_hash := hash_string(info.fullpath) ~ u64(info.size) ~ modified
 		// Order-independent combination keeps directory enumeration changes from
@@ -1626,14 +1804,14 @@ vault_fingerprint :: proc(root: string) -> u64 {
 
 reload_graph_if_changed :: proc() {
 	now := glfw.GetTime()
-	if now < g_next_vault_scan { return }
+	if now < g_next_vault_scan {return}
 	g_next_vault_scan = now + (g_simulation_active ? 0.75 : 2.0)
 
 	fingerprint := vault_fingerprint(g_root)
-	if fingerprint == g_vault_fingerprint { return }
+	if fingerprint == g_vault_fingerprint {return}
 
 	graph, ok := load_graph(g_root)
-	if !ok { return }
+	if !ok {return}
 	g_last_hovered = -1
 	destroy_graph(&g_graph)
 	g_graph = graph
@@ -1642,33 +1820,40 @@ reload_graph_if_changed :: proc() {
 	g_mesh_dirty = true
 	g_vault_fingerprint = fingerprint
 
-	title := fmt.tprintf("Synapse — %d notes · %d links", len(g_graph.notes), len(g_graph.edges))
+	title := fmt.tprintf(
+		"Synapse — %d notes · %d links",
+		len(g_graph.notes),
+		len(g_graph.edges),
+	)
 	glfw.SetWindowTitle(g_window, strings.clone_to_cstring(title, context.temp_allocator))
 	log.infof("synapse: reloaded %d notes and %d links", len(g_graph.notes), len(g_graph.edges))
 }
 
 create_vertex_buffer :: proc(vertices: []Vertex) {
 	size := vk.DeviceSize(len(vertices) * size_of(Vertex))
-	g_vertex_capacity = 1024*1024
-	for g_vertex_capacity < max(size, 4) { g_vertex_capacity *= 2 }
+	g_vertex_capacity = 1024 * 1024
+	for g_vertex_capacity < max(size, 4) {g_vertex_capacity *= 2}
 	info := vk.BufferCreateInfo {
-		sType = .BUFFER_CREATE_INFO,
-		size = g_vertex_capacity,
-		usage = {.VERTEX_BUFFER},
+		sType       = .BUFFER_CREATE_INFO,
+		size        = g_vertex_capacity,
+		usage       = {.VERTEX_BUFFER},
 		sharingMode = .EXCLUSIVE,
 	}
 	must(vk.CreateBuffer(g_device, &info, nil, &g_vertex_buffer))
 	requirements: vk.MemoryRequirements
 	vk.GetBufferMemoryRequirements(g_device, g_vertex_buffer, &requirements)
 	allocation := vk.MemoryAllocateInfo {
-		sType = .MEMORY_ALLOCATE_INFO,
-		allocationSize = requirements.size,
-		memoryTypeIndex = find_memory_type(requirements.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT}),
+		sType           = .MEMORY_ALLOCATE_INFO,
+		allocationSize  = requirements.size,
+		memoryTypeIndex = find_memory_type(
+			requirements.memoryTypeBits,
+			{.HOST_VISIBLE, .HOST_COHERENT},
+		),
 	}
 	must(vk.AllocateMemory(g_device, &allocation, nil, &g_vertex_memory))
 	must(vk.BindBufferMemory(g_device, g_vertex_buffer, g_vertex_memory, 0))
 	must(vk.MapMemory(g_device, g_vertex_memory, 0, g_vertex_capacity, {}, &g_vertex_mapped))
-	if len(vertices) > 0 { mem.copy(g_vertex_mapped, raw_data(vertices), int(size)) }
+	if len(vertices) > 0 {mem.copy(g_vertex_mapped, raw_data(vertices), int(size))}
 }
 
 scroll_callback :: proc "c" (_: glfw.WindowHandle, _: f64, y: f64) {
@@ -1682,43 +1867,52 @@ handle_input :: proc() {
 		glfw.SetWindowShouldClose(g_window, true)
 	}
 	step := 0.018 / g_zoom
-	if glfw.GetKey(g_window, glfw.KEY_A) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_LEFT) == glfw.PRESS { g_pan.x += step; g_mesh_dirty = true }
-	if glfw.GetKey(g_window, glfw.KEY_D) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_RIGHT) == glfw.PRESS { g_pan.x -= step; g_mesh_dirty = true }
-	if glfw.GetKey(g_window, glfw.KEY_W) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_UP) == glfw.PRESS { g_pan.y -= step; g_mesh_dirty = true }
-	if glfw.GetKey(g_window, glfw.KEY_S) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_DOWN) == glfw.PRESS { g_pan.y += step; g_mesh_dirty = true }
-	if glfw.GetKey(g_window, glfw.KEY_EQUAL) == glfw.PRESS { g_zoom = min(g_zoom*1.02, 8.0); g_mesh_dirty = true }
-	if glfw.GetKey(g_window, glfw.KEY_MINUS) == glfw.PRESS { g_zoom = max(g_zoom/1.02, 0.25); g_mesh_dirty = true }
-	if glfw.GetKey(g_window, glfw.KEY_0) == glfw.PRESS { g_zoom = 1; g_pan = {}; g_mesh_dirty = true }
+	if glfw.GetKey(g_window, glfw.KEY_A) == glfw.PRESS ||
+	   glfw.GetKey(g_window, glfw.KEY_LEFT) == glfw.PRESS {g_pan.x += step; g_mesh_dirty = true}
+	if glfw.GetKey(g_window, glfw.KEY_D) == glfw.PRESS ||
+	   glfw.GetKey(g_window, glfw.KEY_RIGHT) == glfw.PRESS {g_pan.x -= step; g_mesh_dirty = true}
+	if glfw.GetKey(g_window, glfw.KEY_W) == glfw.PRESS ||
+	   glfw.GetKey(g_window, glfw.KEY_UP) == glfw.PRESS {g_pan.y -= step; g_mesh_dirty = true}
+	if glfw.GetKey(g_window, glfw.KEY_S) == glfw.PRESS ||
+	   glfw.GetKey(g_window, glfw.KEY_DOWN) == glfw.PRESS {g_pan.y += step; g_mesh_dirty = true}
+	if glfw.GetKey(g_window, glfw.KEY_EQUAL) ==
+	   glfw.PRESS {g_zoom = min(g_zoom * 1.02, 8.0); g_mesh_dirty = true}
+	if glfw.GetKey(g_window, glfw.KEY_MINUS) ==
+	   glfw.PRESS {g_zoom = max(g_zoom / 1.02, 0.25); g_mesh_dirty = true}
+	if glfw.GetKey(g_window, glfw.KEY_0) ==
+	   glfw.PRESS {g_zoom = 1; g_pan = {}; g_mesh_dirty = true}
 
 	// Hovering rebuilds only the small graph vertex buffer. The native window,
 	// swapchain, camera position, and Vulkan pipeline all remain intact.
 	x, y := glfw.GetCursorPos(g_window)
 	w, h := glfw.GetWindowSize(g_window)
-	if w <= 0 || h <= 0 { return }
-	aspect := f32(w)/f32(h)
-	world := Vec2{
-		(f32(x)/f32(w)*2-1)*aspect/g_zoom - g_pan.x,
-		(f32(y)/f32(h)*2-1)/g_zoom - g_pan.y,
+	if w <= 0 || h <= 0 {return}
+	aspect := f32(w) / f32(h)
+	world := Vec2 {
+		(f32(x) / f32(w) * 2 - 1) * aspect / g_zoom - g_pan.x,
+		(f32(y) / f32(h) * 2 - 1) / g_zoom - g_pan.y,
 	}
 	hovered := -1
 	best := max(f32)
 	for note, i in g_graph.notes {
-		dx, dy := note.pos.x-world.x, note.pos.y-world.y
-		d2 := dx*dx+dy*dy
-		hit_radius := node_radius(g_degrees[i])*g_node_scales[i] + 0.008/g_zoom
-		if d2 <= hit_radius*hit_radius && d2 < best { best = d2; hovered = i }
+		dx, dy := note.pos.x - world.x, note.pos.y - world.y
+		d2 := dx * dx + dy * dy
+		hit_radius := node_radius(g_degrees[i]) * g_node_scales[i] + 0.008 / g_zoom
+		if d2 <= hit_radius * hit_radius && d2 < best {best = d2; hovered = i}
 	}
 	mouse_down := glfw.GetMouseButton(g_window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
 	if mouse_down && !g_mouse_was_down && hovered >= 0 {
 		g_dragged_node = hovered
-		g_drag_offset = {g_graph.notes[hovered].pos.x-world.x, g_graph.notes[hovered].pos.y-world.y}
+		g_drag_offset = {
+			g_graph.notes[hovered].pos.x - world.x,
+			g_graph.notes[hovered].pos.y - world.y,
+		}
 		g_simulation_active = true
-		g_simulation_frames = 0
-		g_stable_frames = 0
+		g_stable_time_ms = 0
 	}
 	if mouse_down && g_dragged_node >= 0 {
 		note := &g_graph.notes[g_dragged_node]
-		note.pos = {world.x+g_drag_offset.x, world.y+g_drag_offset.y}
+		note.pos = {world.x + g_drag_offset.x, world.y + g_drag_offset.y}
 		note.vel = {}
 		hovered = g_dragged_node
 		g_mesh_dirty = true
@@ -1726,17 +1920,24 @@ handle_input :: proc() {
 	if !mouse_down && g_mouse_was_down && g_dragged_node >= 0 {
 		g_dragged_node = -1
 		g_simulation_active = true
-		g_simulation_frames = 0
-		g_stable_frames = 0
+		g_stable_time_ms = 0
 	}
 	g_mouse_was_down = mouse_down
 
 	if hovered != g_last_hovered {
 		if hovered >= 0 {
-			title := fmt.tprintf("Synapse — %s  [%s]", g_graph.notes[hovered].title, g_graph.notes[hovered].id)
+			title := fmt.tprintf(
+				"Synapse — %s  [%s]",
+				g_graph.notes[hovered].title,
+				g_graph.notes[hovered].id,
+			)
 			glfw.SetWindowTitle(g_window, strings.clone_to_cstring(title, context.temp_allocator))
 		} else {
-			title := fmt.tprintf("Synapse — %d notes · %d links", len(g_graph.notes), len(g_graph.edges))
+			title := fmt.tprintf(
+				"Synapse — %d notes · %d links",
+				len(g_graph.notes),
+				len(g_graph.edges),
+			)
 			glfw.SetWindowTitle(g_window, strings.clone_to_cstring(title, context.temp_allocator))
 		}
 		g_last_hovered = hovered
