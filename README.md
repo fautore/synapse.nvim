@@ -3,14 +3,15 @@
 A Neovim extension that scans the repository containing the current buffer and opens its Markdown notes as an Obsidian-style knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).
 
 - `[[wiki links]]`, aliases, headings, and Markdown links to `.md` files
-- force-directed layout with connection-weighted node sizing
+- animated force-directed layout with center gravity and connection-weighted node sizing
 - unresolved links rendered as dim ghost nodes and connectors
 - antialiased node and connector edges
 - current-buffer node highlighted with the configured accent
 - live in-window graph reload for Markdown changes, including changes made outside Neovim
 - colors inherited from Neovim and updated live on `:colorscheme` changes
 - terminal font detection for Kitty and Ghostty, with Fontconfig fallback
-- hover focus enlarges the node, highlights its neighbors/links, and labels it directly below the node
+- smooth hover focus enlarges the node, highlights its neighbors/links, and labels it directly below the node
+- mouse dragging pins and moves nodes while neighboring nodes respond physically
 - GPU rendering through Vulkan; GLFW is used only for the native window/input
 - repository detection via `.obsidian`, `.git`, or `.jj`
 
@@ -64,6 +65,7 @@ Window controls:
 | Input | Action |
 |---|---|
 | mouse wheel / `+` / `-` | zoom |
+| left-drag a node | reposition it and pull connected nodes |
 | arrows or `W A S D` | pan |
 | `0` | reset view |
 | hover | show the note title/path in the window title |

@@ -36,7 +36,7 @@ SHADER_FRAG :: #load("../target/shaders/frag.spv")
 // Enables Vulkan debug logging and validation layers.
 ENABLE_VALIDATION_LAYERS :: #config(ENABLE_VALIDATION_LAYERS, false)
 
-MAX_FRAMES_IN_FLIGHT :: 2
+MAX_FRAMES_IN_FLIGHT :: 1
 
 g_ctx: runtime.Context
 
@@ -48,9 +48,22 @@ g_graph: Graph
 g_vertices: [dynamic]Vertex
 g_vertex_buffer: vk.Buffer
 g_vertex_memory: vk.DeviceMemory
+g_vertex_mapped: rawptr
+g_vertex_capacity: vk.DeviceSize
 g_zoom: f32 = 1.0
 g_pan := Vec2{}
 g_last_hovered := -1
+g_dragged_node := -1
+g_mouse_was_down: bool
+g_drag_offset: Vec2
+g_node_scales: []f32
+g_node_focus: []f32
+g_edge_focus: []f32
+g_hover_presence: f32
+g_simulation_active := true
+g_stable_frames: int
+g_mesh_dirty: bool
+g_last_frame_time: f64
 g_degrees: []int
 g_root: string
 g_current: string
@@ -156,8 +169,8 @@ main :: proc() {
 	ok: bool
 	g_graph, ok = load_graph(g_root)
 	if !ok { log.panicf("could not scan vault %q", g_root) }
-	layout_graph(&g_graph)
 	rebuild_degrees()
+	rebuild_animation_state()
 	g_vertices = build_mesh(&g_graph, g_current)
 	g_vault_fingerprint = vault_fingerprint(g_root)
 	log.infof("synapse: loaded %d notes and %d links", len(g_graph.notes), len(g_graph.edges))
@@ -519,6 +532,7 @@ main :: proc() {
 	defer for fence in g_in_flight_fences {vk.DestroyFence(g_device, fence, nil)}
 
 	current_frame := 0
+	g_last_frame_time = glfw.GetTime()
 	for !glfw.WindowShouldClose(g_window) {
 		free_all(context.temp_allocator)
 
@@ -527,8 +541,17 @@ main :: proc() {
 		reload_graph_if_changed()
 		reload_theme_if_changed()
 
-		// Wait for previous frame.
+		// With one frame in flight, this fence also makes the persistently mapped
+		// vertex buffer safe to update for animation without stalling the device.
 		must(vk.WaitForFences(g_device, 1, &g_in_flight_fences[current_frame], true, max(u64)))
+		now := glfw.GetTime()
+		delta := f32(clamp(now-g_last_frame_time, 0.0, 0.05))
+		g_last_frame_time = now
+		animation_changed := update_graph_animation(delta)
+		if animation_changed || g_mesh_dirty {
+			upload_vertex_data(build_mesh(&g_graph, g_current))
+			g_mesh_dirty = false
+		}
 
 		// Acquire an image from the swapchain.
 		image_index: u32
@@ -1090,6 +1113,118 @@ rebuild_degrees :: proc() {
 	}
 }
 
+rebuild_animation_state :: proc() {
+	delete(g_node_scales)
+	delete(g_node_focus)
+	delete(g_edge_focus)
+	g_node_scales = make([]f32, len(g_graph.notes))
+	g_node_focus = make([]f32, len(g_graph.notes))
+	g_edge_focus = make([]f32, len(g_graph.edges))
+	for &scale in g_node_scales { scale = 1 }
+	g_hover_presence = 0
+	g_dragged_node = -1
+	g_simulation_active = true
+	g_stable_frames = 0
+}
+
+update_graph_animation :: proc(delta: f32) -> bool {
+	if delta <= 0 { return false }
+	changed := false
+	blend := min(1.0, delta*14)
+	hover_target: f32 = g_last_hovered >= 0 ? 1 : 0
+	old_hover := g_hover_presence
+	g_hover_presence += (hover_target-g_hover_presence)*blend
+	if abs(g_hover_presence-old_hover) > 0.0001 { changed = true }
+
+	target_focus := make([]f32, len(g_graph.notes), context.temp_allocator)
+	if g_last_hovered >= 0 && g_last_hovered < len(g_graph.notes) {
+		target_focus[g_last_hovered] = 1
+		for edge, edge_index in g_graph.edges {
+			edge_target: f32
+			if edge.from == g_last_hovered {
+				target_focus[edge.to] = max(target_focus[edge.to], 0.65)
+				edge_target = 1
+			} else if edge.to == g_last_hovered {
+				target_focus[edge.from] = max(target_focus[edge.from], 0.65)
+				edge_target = 1
+			}
+			old := g_edge_focus[edge_index]
+			g_edge_focus[edge_index] += (edge_target-old)*blend
+			if abs(g_edge_focus[edge_index]-old) > 0.0001 { changed = true }
+		}
+	} else {
+		for &focus in g_edge_focus {
+			old := focus
+			focus += (0-focus)*blend
+			if abs(focus-old) > 0.0001 { changed = true }
+		}
+	}
+	for i in 0..<len(g_graph.notes) {
+		old_focus := g_node_focus[i]
+		g_node_focus[i] += (target_focus[i]-old_focus)*blend
+		target_scale := 1.0 + target_focus[i]*0.7
+		if target_focus[i] > 0 && target_focus[i] < 1 { target_scale = 1.15 }
+		old_scale := g_node_scales[i]
+		g_node_scales[i] += (target_scale-old_scale)*blend
+		if abs(g_node_focus[i]-old_focus) > 0.0001 || abs(g_node_scales[i]-old_scale) > 0.0001 {
+			changed = true
+		}
+	}
+
+	if !g_simulation_active { return changed }
+	frame_scale := delta*60
+	n := len(g_graph.notes)
+	stride := 1
+	if n > 900 { stride = max(1, n/700) }
+	for i in 0..<n {
+		for j := i+1; j < n; j += stride {
+			dx := g_graph.notes[i].pos.x-g_graph.notes[j].pos.x
+			dy := g_graph.notes[i].pos.y-g_graph.notes[j].pos.y
+			distance_squared := dx*dx+dy*dy+0.0015
+			force := 0.00012/distance_squared*frame_scale
+			g_graph.notes[i].vel.x += dx*force
+			g_graph.notes[i].vel.y += dy*force
+			g_graph.notes[j].vel.x -= dx*force
+			g_graph.notes[j].vel.y -= dy*force
+		}
+	}
+	for edge in g_graph.edges {
+		a, b := &g_graph.notes[edge.from], &g_graph.notes[edge.to]
+		dx, dy := b.pos.x-a.pos.x, b.pos.y-a.pos.y
+		distance := math.sqrt(dx*dx+dy*dy+0.0001)
+		force := (distance-0.16)*0.010*frame_scale
+		x, y := dx/distance*force, dy/distance*force
+		a.vel.x += x; a.vel.y += y
+		b.vel.x -= x; b.vel.y -= y
+	}
+
+	energy: f32
+	damping := math.pow(0.82, frame_scale)
+	for &note, i in g_graph.notes {
+		if i == g_dragged_node {
+			note.vel = {}
+			continue
+		}
+		// Center gravity keeps disconnected clusters in the same field, matching
+		// Obsidian's continuously settling graph rather than a one-shot layout.
+		note.vel.x += -note.pos.x*0.0012*frame_scale
+		note.vel.y += -note.pos.y*0.0012*frame_scale
+		note.vel.x = clamp(note.vel.x*damping, -0.035, 0.035)
+		note.vel.y = clamp(note.vel.y*damping, -0.035, 0.035)
+		note.pos.x += note.vel.x*frame_scale
+		note.pos.y += note.vel.y*frame_scale
+		energy += note.vel.x*note.vel.x+note.vel.y*note.vel.y
+	}
+	changed = true
+	if energy < 0.0000005 && g_dragged_node < 0 {
+		g_stable_frames += 1
+		if g_stable_frames > 90 { g_simulation_active = false }
+	} else {
+		g_stable_frames = 0
+	}
+	return changed
+}
+
 append_antialiased_link :: proc(
 	vertices: ^[dynamic]Vertex,
 	a, b: Vec2,
@@ -1280,32 +1415,20 @@ append_hover_label :: proc(vertices: ^[dynamic]Vertex, title: string, center: Ve
 
 build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
 	vertices := make([dynamic]Vertex, 0, len(graph.edges)*24 + len(graph.notes)*252)
-	connected := make([]bool, len(graph.notes), context.temp_allocator)
-	if g_last_hovered >= 0 && g_last_hovered < len(graph.notes) {
-		connected[g_last_hovered] = true
-		for edge in graph.edges {
-			if edge.from == g_last_hovered { connected[edge.to] = true }
-			if edge.to == g_last_hovered { connected[edge.from] = true }
-		}
-	}
 
-	for edge in graph.edges {
+	for edge, edge_index in graph.edges {
 		a, b := graph.notes[edge.from].pos, graph.notes[edge.to].pos
-		is_hover_link := g_last_hovered >= 0 && (edge.from == g_last_hovered || edge.to == g_last_hovered)
 		is_ghost := !graph.notes[edge.from].exists || !graph.notes[edge.to].exists
 		color := is_ghost ? with_alpha(g_ghost_color, 0.65) : g_edge_color
-		width: f32 = 0.0018
-		if is_hover_link {
-			color = with_alpha(g_highlight_color, 0.9)
-			width = 0.0032
-		} else if g_last_hovered >= 0 {
-			color = with_alpha(color, 0.28)
-		}
+		focus := g_edge_focus[edge_index]
+		color = mix_color(color, with_alpha(g_highlight_color, 0.9), focus)
+		color = with_alpha(color, 1.0-g_hover_presence*(1.0-focus)*0.72)
+		width := 0.0018+(0.0032-0.0018)*focus
 		append_antialiased_link(&vertices, a, b, color, width)
 	}
 
 	for note, i in graph.notes {
-		radius := node_radius(g_degrees[i])
+		radius := node_radius(g_degrees[i])*g_node_scales[i]
 		color := g_node_color
 		if !note.exists {
 			color = g_ghost_color
@@ -1313,23 +1436,15 @@ build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
 			color = g_muted_color
 		}
 		if len(current) > 0 && note.id == current { color = g_highlight_color }
-		if g_last_hovered >= 0 {
-			if i == g_last_hovered {
-				color = g_highlight_color
-				radius *= 1.7
-			} else if connected[i] {
-				color = mix_color(color, g_highlight_color, 0.55)
-				radius *= 1.15
-			} else {
-				color = with_alpha(color, 0.48)
-			}
-		}
+		focus := g_node_focus[i]
+		color = mix_color(color, g_highlight_color, focus)
+		color = with_alpha(color, 1.0-g_hover_presence*(1.0-focus)*0.52)
 		append_antialiased_node(&vertices, note.pos, radius, color)
 	}
 
 	if g_last_hovered >= 0 && g_last_hovered < len(graph.notes) {
 		hovered := graph.notes[g_last_hovered]
-		radius := node_radius(g_degrees[g_last_hovered])*1.7
+		radius := node_radius(g_degrees[g_last_hovered])*g_node_scales[g_last_hovered]
 		append_hover_label(&vertices, hovered.title, hovered.pos, radius)
 	}
 	return vertices
@@ -1347,6 +1462,10 @@ find_memory_type :: proc(bits: u32, wanted: vk.MemoryPropertyFlags) -> u32 {
 }
 
 destroy_vertex_buffer :: proc() {
+	if g_vertex_mapped != nil && g_vertex_memory != 0 {
+		vk.UnmapMemory(g_device, g_vertex_memory)
+		g_vertex_mapped = nil
+	}
 	if g_vertex_buffer != 0 {
 		vk.DestroyBuffer(g_device, g_vertex_buffer, nil)
 		g_vertex_buffer = {}
@@ -1355,6 +1474,7 @@ destroy_vertex_buffer :: proc() {
 		vk.FreeMemory(g_device, g_vertex_memory, nil)
 		g_vertex_memory = {}
 	}
+	g_vertex_capacity = 0
 }
 
 hex_digit :: proc(value: byte) -> (u8, bool) {
@@ -1434,12 +1554,23 @@ replace_vertex_data :: proc(vertices: [dynamic]Vertex) {
 	create_vertex_buffer(g_vertices[:])
 }
 
+upload_vertex_data :: proc(vertices: [dynamic]Vertex) {
+	size := vk.DeviceSize(len(vertices)*size_of(Vertex))
+	if size > g_vertex_capacity {
+		replace_vertex_data(vertices)
+		return
+	}
+	delete(g_vertices)
+	g_vertices = vertices
+	if size > 0 { mem.copy(g_vertex_mapped, raw_data(g_vertices), int(size)) }
+}
+
 reload_theme_if_changed :: proc() {
 	now := glfw.GetTime()
 	if now < g_next_theme_scan { return }
 	g_next_theme_scan = now + 0.25
 	if load_theme(g_theme_file) {
-		replace_vertex_data(build_mesh(&g_graph, g_current))
+		g_mesh_dirty = true
 		log.info("synapse: updated colors from Neovim")
 	}
 }
@@ -1475,16 +1606,12 @@ reload_graph_if_changed :: proc() {
 
 	graph, ok := load_graph(g_root)
 	if !ok { return }
-	layout_graph(&graph)
 	g_last_hovered = -1
 	destroy_graph(&g_graph)
 	g_graph = graph
 	rebuild_degrees()
-	vertices := build_mesh(&g_graph, g_current)
-
-	// Command buffers may still refer to the old vertex buffer. Waiting here is
-	// infrequent and lets us replace only GPU graph data, not the native window.
-	replace_vertex_data(vertices)
+	rebuild_animation_state()
+	g_mesh_dirty = true
 	g_vault_fingerprint = fingerprint
 
 	title := fmt.tprintf("Synapse — %d notes · %d links", len(g_graph.notes), len(g_graph.edges))
@@ -1494,11 +1621,11 @@ reload_graph_if_changed :: proc() {
 
 create_vertex_buffer :: proc(vertices: []Vertex) {
 	size := vk.DeviceSize(len(vertices) * size_of(Vertex))
-	// Vulkan does not permit zero-sized buffers; an empty vault still opens.
-	if size == 0 { size = 4 }
+	g_vertex_capacity = 1024*1024
+	for g_vertex_capacity < max(size, 4) { g_vertex_capacity *= 2 }
 	info := vk.BufferCreateInfo {
 		sType = .BUFFER_CREATE_INFO,
-		size = size,
+		size = g_vertex_capacity,
 		usage = {.VERTEX_BUFFER},
 		sharingMode = .EXCLUSIVE,
 	}
@@ -1512,17 +1639,14 @@ create_vertex_buffer :: proc(vertices: []Vertex) {
 	}
 	must(vk.AllocateMemory(g_device, &allocation, nil, &g_vertex_memory))
 	must(vk.BindBufferMemory(g_device, g_vertex_buffer, g_vertex_memory, 0))
-	if len(vertices) > 0 {
-		mapped: rawptr
-		must(vk.MapMemory(g_device, g_vertex_memory, 0, size, {}, &mapped))
-		mem.copy(mapped, raw_data(vertices), int(size))
-		vk.UnmapMemory(g_device, g_vertex_memory)
-	}
+	must(vk.MapMemory(g_device, g_vertex_memory, 0, g_vertex_capacity, {}, &g_vertex_mapped))
+	if len(vertices) > 0 { mem.copy(g_vertex_mapped, raw_data(vertices), int(size)) }
 }
 
 scroll_callback :: proc "c" (_: glfw.WindowHandle, _: f64, y: f64) {
 	context = g_ctx
 	g_zoom = clamp(g_zoom * math.pow(1.12, f32(y)), 0.25, 8.0)
+	g_mesh_dirty = true
 }
 
 handle_input :: proc() {
@@ -1530,13 +1654,13 @@ handle_input :: proc() {
 		glfw.SetWindowShouldClose(g_window, true)
 	}
 	step := 0.018 / g_zoom
-	if glfw.GetKey(g_window, glfw.KEY_A) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_LEFT) == glfw.PRESS { g_pan.x += step }
-	if glfw.GetKey(g_window, glfw.KEY_D) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_RIGHT) == glfw.PRESS { g_pan.x -= step }
-	if glfw.GetKey(g_window, glfw.KEY_W) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_UP) == glfw.PRESS { g_pan.y -= step }
-	if glfw.GetKey(g_window, glfw.KEY_S) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_DOWN) == glfw.PRESS { g_pan.y += step }
-	if glfw.GetKey(g_window, glfw.KEY_EQUAL) == glfw.PRESS { g_zoom = min(g_zoom*1.02, 8.0) }
-	if glfw.GetKey(g_window, glfw.KEY_MINUS) == glfw.PRESS { g_zoom = max(g_zoom/1.02, 0.25) }
-	if glfw.GetKey(g_window, glfw.KEY_0) == glfw.PRESS { g_zoom = 1; g_pan = {} }
+	if glfw.GetKey(g_window, glfw.KEY_A) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_LEFT) == glfw.PRESS { g_pan.x += step; g_mesh_dirty = true }
+	if glfw.GetKey(g_window, glfw.KEY_D) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_RIGHT) == glfw.PRESS { g_pan.x -= step; g_mesh_dirty = true }
+	if glfw.GetKey(g_window, glfw.KEY_W) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_UP) == glfw.PRESS { g_pan.y -= step; g_mesh_dirty = true }
+	if glfw.GetKey(g_window, glfw.KEY_S) == glfw.PRESS || glfw.GetKey(g_window, glfw.KEY_DOWN) == glfw.PRESS { g_pan.y += step; g_mesh_dirty = true }
+	if glfw.GetKey(g_window, glfw.KEY_EQUAL) == glfw.PRESS { g_zoom = min(g_zoom*1.02, 8.0); g_mesh_dirty = true }
+	if glfw.GetKey(g_window, glfw.KEY_MINUS) == glfw.PRESS { g_zoom = max(g_zoom/1.02, 0.25); g_mesh_dirty = true }
+	if glfw.GetKey(g_window, glfw.KEY_0) == glfw.PRESS { g_zoom = 1; g_pan = {}; g_mesh_dirty = true }
 
 	// Hovering rebuilds only the small graph vertex buffer. The native window,
 	// swapchain, camera position, and Vulkan pipeline all remain intact.
@@ -1553,9 +1677,30 @@ handle_input :: proc() {
 	for note, i in g_graph.notes {
 		dx, dy := note.pos.x-world.x, note.pos.y-world.y
 		d2 := dx*dx+dy*dy
-		hit_radius := node_radius(g_degrees[i]) + 0.008/g_zoom
+		hit_radius := node_radius(g_degrees[i])*g_node_scales[i] + 0.008/g_zoom
 		if d2 <= hit_radius*hit_radius && d2 < best { best = d2; hovered = i }
 	}
+	mouse_down := glfw.GetMouseButton(g_window, glfw.MOUSE_BUTTON_LEFT) == glfw.PRESS
+	if mouse_down && !g_mouse_was_down && hovered >= 0 {
+		g_dragged_node = hovered
+		g_drag_offset = {g_graph.notes[hovered].pos.x-world.x, g_graph.notes[hovered].pos.y-world.y}
+		g_simulation_active = true
+		g_stable_frames = 0
+	}
+	if mouse_down && g_dragged_node >= 0 {
+		note := &g_graph.notes[g_dragged_node]
+		note.pos = {world.x+g_drag_offset.x, world.y+g_drag_offset.y}
+		note.vel = {}
+		hovered = g_dragged_node
+		g_mesh_dirty = true
+	}
+	if !mouse_down && g_mouse_was_down && g_dragged_node >= 0 {
+		g_dragged_node = -1
+		g_simulation_active = true
+		g_stable_frames = 0
+	}
+	g_mouse_was_down = mouse_down
+
 	if hovered != g_last_hovered {
 		if hovered >= 0 {
 			title := fmt.tprintf("Synapse — %s  [%s]", g_graph.notes[hovered].title, g_graph.notes[hovered].id)
@@ -1565,7 +1710,7 @@ handle_input :: proc() {
 			glfw.SetWindowTitle(g_window, strings.clone_to_cstring(title, context.temp_allocator))
 		}
 		g_last_hovered = hovered
-		replace_vertex_data(build_mesh(&g_graph, g_current))
+		g_mesh_dirty = true
 	}
 }
 
