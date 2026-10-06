@@ -61,6 +61,8 @@ g_node_focus: []f32
 g_edge_focus: []f32
 g_hover_presence: f32
 g_simulation_active := true
+g_visual_animation_active: bool
+g_simulation_frames: int
 g_stable_frames: int
 g_mesh_dirty: bool
 g_last_frame_time: f64
@@ -201,6 +203,10 @@ main :: proc() {
 
 	glfw.SetFramebufferSizeCallback(g_window, proc "c" (_: glfw.WindowHandle, _, _: i32) {
 		g_framebuffer_resized = true
+		g_mesh_dirty = true
+	})
+	glfw.SetWindowRefreshCallback(g_window, proc "c" (_: glfw.WindowHandle) {
+		g_mesh_dirty = true
 	})
 
 	vk.load_proc_addresses_global(rawptr(glfw.GetInstanceProcAddress))
@@ -536,18 +542,29 @@ main :: proc() {
 	for !glfw.WindowShouldClose(g_window) {
 		free_all(context.temp_allocator)
 
-		glfw.PollEvents()
+		continuous := g_simulation_active || g_visual_animation_active ||
+		              g_dragged_node >= 0 || g_mesh_dirty
+		if continuous {
+			glfw.PollEvents()
+		} else {
+			// Cursor, keyboard, resize and close events wake this immediately. The
+			// timeout only exists so external Markdown changes are still detected.
+			glfw.WaitEventsTimeout(0.5)
+		}
 		handle_input()
 		reload_graph_if_changed()
 		reload_theme_if_changed()
 
-		// With one frame in flight, this fence also makes the persistently mapped
-		// vertex buffer safe to update for animation without stalling the device.
-		must(vk.WaitForFences(g_device, 1, &g_in_flight_fences[current_frame], true, max(u64)))
 		now := glfw.GetTime()
 		delta := f32(clamp(now-g_last_frame_time, 0.0, 0.05))
 		g_last_frame_time = now
 		animation_changed := update_graph_animation(delta)
+		should_render := animation_changed || g_mesh_dirty || g_framebuffer_resized
+		if !should_render { continue }
+
+		// With one frame in flight, this fence also makes the persistently mapped
+		// vertex buffer safe to update for animation without stalling the device.
+		must(vk.WaitForFences(g_device, 1, &g_in_flight_fences[current_frame], true, max(u64)))
 		if animation_changed || g_mesh_dirty {
 			upload_vertex_data(build_mesh(&g_graph, g_current))
 			g_mesh_dirty = false
@@ -1124,17 +1141,20 @@ rebuild_animation_state :: proc() {
 	g_hover_presence = 0
 	g_dragged_node = -1
 	g_simulation_active = true
+	g_visual_animation_active = false
+	g_simulation_frames = 0
 	g_stable_frames = 0
 }
 
 update_graph_animation :: proc(delta: f32) -> bool {
 	if delta <= 0 { return false }
 	changed := false
+	visual_changed := false
 	blend := min(1.0, delta*14)
 	hover_target: f32 = g_last_hovered >= 0 ? 1 : 0
 	old_hover := g_hover_presence
 	g_hover_presence += (hover_target-g_hover_presence)*blend
-	if abs(g_hover_presence-old_hover) > 0.0001 { changed = true }
+	if abs(g_hover_presence-old_hover) > 0.0001 { changed = true; visual_changed = true }
 
 	target_focus := make([]f32, len(g_graph.notes), context.temp_allocator)
 	if g_last_hovered >= 0 && g_last_hovered < len(g_graph.notes) {
@@ -1150,13 +1170,13 @@ update_graph_animation :: proc(delta: f32) -> bool {
 			}
 			old := g_edge_focus[edge_index]
 			g_edge_focus[edge_index] += (edge_target-old)*blend
-			if abs(g_edge_focus[edge_index]-old) > 0.0001 { changed = true }
+			if abs(g_edge_focus[edge_index]-old) > 0.0001 { changed = true; visual_changed = true }
 		}
 	} else {
 		for &focus in g_edge_focus {
 			old := focus
 			focus += (0-focus)*blend
-			if abs(focus-old) > 0.0001 { changed = true }
+			if abs(focus-old) > 0.0001 { changed = true; visual_changed = true }
 		}
 	}
 	for i in 0..<len(g_graph.notes) {
@@ -1168,10 +1188,13 @@ update_graph_animation :: proc(delta: f32) -> bool {
 		g_node_scales[i] += (target_scale-old_scale)*blend
 		if abs(g_node_focus[i]-old_focus) > 0.0001 || abs(g_node_scales[i]-old_scale) > 0.0001 {
 			changed = true
+			visual_changed = true
 		}
 	}
+	g_visual_animation_active = visual_changed
 
 	if !g_simulation_active { return changed }
+	g_simulation_frames += 1
 	frame_scale := delta*60
 	n := len(g_graph.notes)
 	stride := 1
@@ -1216,11 +1239,16 @@ update_graph_animation :: proc(delta: f32) -> bool {
 		energy += note.vel.x*note.vel.x+note.vel.y*note.vel.y
 	}
 	changed = true
-	if energy < 0.0000005 && g_dragged_node < 0 {
+	if energy < 0.000005 && g_dragged_node < 0 {
 		g_stable_frames += 1
-		if g_stable_frames > 90 { g_simulation_active = false }
 	} else {
 		g_stable_frames = 0
+	}
+	// Stop tiny perpetual oscillations. Interaction or a graph reload starts the
+	// solver again, so an idle window consumes no continuous CPU/GPU time.
+	if g_stable_frames > 45 || (g_simulation_frames > 480 && g_dragged_node < 0) {
+		g_simulation_active = false
+		for &note in g_graph.notes { note.vel = {} }
 	}
 	return changed
 }
@@ -1568,7 +1596,7 @@ upload_vertex_data :: proc(vertices: [dynamic]Vertex) {
 reload_theme_if_changed :: proc() {
 	now := glfw.GetTime()
 	if now < g_next_theme_scan { return }
-	g_next_theme_scan = now + 0.25
+	g_next_theme_scan = now + (g_simulation_active ? 0.5 : 1.0)
 	if load_theme(g_theme_file) {
 		g_mesh_dirty = true
 		log.info("synapse: updated colors from Neovim")
@@ -1599,7 +1627,7 @@ vault_fingerprint :: proc(root: string) -> u64 {
 reload_graph_if_changed :: proc() {
 	now := glfw.GetTime()
 	if now < g_next_vault_scan { return }
-	g_next_vault_scan = now + 0.5
+	g_next_vault_scan = now + (g_simulation_active ? 0.75 : 2.0)
 
 	fingerprint := vault_fingerprint(g_root)
 	if fingerprint == g_vault_fingerprint { return }
@@ -1685,6 +1713,7 @@ handle_input :: proc() {
 		g_dragged_node = hovered
 		g_drag_offset = {g_graph.notes[hovered].pos.x-world.x, g_graph.notes[hovered].pos.y-world.y}
 		g_simulation_active = true
+		g_simulation_frames = 0
 		g_stable_frames = 0
 	}
 	if mouse_down && g_dragged_node >= 0 {
@@ -1697,6 +1726,7 @@ handle_input :: proc() {
 	if !mouse_down && g_mouse_was_down && g_dragged_node >= 0 {
 		g_dragged_node = -1
 		g_simulation_active = true
+		g_simulation_frames = 0
 		g_stable_frames = 0
 	}
 	g_mouse_was_down = mouse_down

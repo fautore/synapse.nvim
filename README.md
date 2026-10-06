@@ -12,6 +12,7 @@ A Neovim extension that scans the repository containing the current buffer and o
 - terminal font detection for Kitty and Ghostty, with Fontconfig fallback
 - smooth hover focus enlarges the node, highlights its neighbors/links, and labels it directly below the node
 - mouse dragging pins and moves nodes while neighboring nodes respond physically
+- event-driven idle mode stops physics and frame presentation after the graph settles
 - GPU rendering through Vulkan; GLFW is used only for the native window/input
 - repository detection via `.obsidian`, `.git`, or `.jj`
 
