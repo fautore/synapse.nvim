@@ -30,8 +30,8 @@ when ODIN_OS == .Darwin {
 	foreign import __ "system:System.framework"
 }
 
-SHADER_VERT :: #load("vert.spv")
-SHADER_FRAG :: #load("frag.spv")
+SHADER_VERT :: #load("../target/shaders/vert.spv")
+SHADER_FRAG :: #load("../target/shaders/frag.spv")
 
 // Enables Vulkan debug logging and validation layers.
 ENABLE_VALIDATION_LAYERS :: #config(ENABLE_VALIDATION_LAYERS, false)

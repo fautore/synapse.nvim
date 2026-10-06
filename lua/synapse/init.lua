@@ -48,24 +48,30 @@ local function newer_than(path, timestamp)
   return stat and stat.mtime.sec > timestamp
 end
 
+local function source_tree_is_newer(directory, timestamp)
+  for name, kind in vim.fs.dir(directory) do
+    local path = directory .. "/" .. name
+    if kind == "directory" then
+      if source_tree_is_newer(path, timestamp) then
+        return true
+      end
+    elseif kind == "file" and
+        (name:match("%.odin$") or name:match("%.c$") or name:match("%.vert$") or name:match("%.frag$")) and
+        newer_than(path, timestamp) then
+      return true
+    end
+  end
+  return false
+end
+
 local function needs_build()
   local binary = uv.fs_stat(config.executable)
   if not binary then
     return true
   end
   local source_time = binary.mtime.sec
-  for name, kind in vim.fs.dir(plugin_root .. "/app") do
-    if kind == "file" and
-        (name:match("%.odin$") or name:match("%.c$") or name:match("%.vert$") or name:match("%.frag$")) then
-      if newer_than(plugin_root .. "/app/" .. name, source_time) then
-        return true
-      end
-    end
-  end
-  if newer_than(plugin_root .. "/Makefile", source_time) then
-    return true
-  end
-  return false
+  return source_tree_is_newer(plugin_root .. "/src", source_time)
+      or newer_than(plugin_root .. "/Makefile", source_time)
 end
 
 local function vault_for_buffer(bufnr)

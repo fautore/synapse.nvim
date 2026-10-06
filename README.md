@@ -100,6 +100,16 @@ Directories such as `.git`, `.jj`, `.obsidian`, `node_modules`, `.direnv`, and `
 
 ## Development
 
+Project layout:
+
+```text
+src/                  Odin renderer and graph sources
+src/font_bridge.c     FreeType bridge
+src/shaders/          GLSL shader sources
+target/shaders/       generated SPIR-V shaders
+target/synapse        generated renderer executable
+```
+
 ```sh
 make check
 make
