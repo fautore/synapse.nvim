@@ -6,14 +6,13 @@ A Neovim extension that scans the repository containing the current buffer and o
 - canvas file cards and links inside canvas text nodes
 - `[[wiki links]]`, aliases, headings, and Markdown links to notes or canvases
 - animated force-directed layout with center gravity and connection-weighted node sizing
-- unresolved links rendered as dim ghost nodes and connectors
 - antialiased node and connector edges
 - current-buffer node highlighted with the configured accent
 - live in-window graph reload for Markdown and canvas changes, including changes made outside Neovim
 - colors inherited from Neovim and updated live on `:colorscheme` changes
 - terminal font detection for Kitty and Ghostty, with Fontconfig fallback
 - smooth hover focus enlarges the node, highlights its neighbors/links, and labels it directly below the node
-- mouse dragging pins and moves nodes while neighboring nodes respond physically
+- mouse dragging pans the view or pins and moves nodes while neighbors respond physically
 - event-driven idle mode stops physics and frame presentation after the graph settles
 - GPU rendering through Vulkan; GLFW is used only for the native window/input
 - repository detection via `.obsidian`, `.git`, or `.jj`
@@ -68,6 +67,7 @@ Window controls:
 | Input | Action |
 |---|---|
 | mouse wheel / `+` / `-` | zoom |
+| left-drag the background or middle-drag | pan |
 | left-drag a node | reposition it and pull connected nodes |
 | arrows or `W A S D` | pan |
 | `0` | reset view |
@@ -94,7 +94,6 @@ require("synapse").setup({
     edge = "Comment",            -- links
     muted = "NonText",           -- unlinked notes
     current = "DiagnosticWarn",  -- current-buffer note
-    ghost = "LineNr",            -- unresolved links
   },
   -- root = "/fixed/vault", -- string or function(start_path) -> root
   -- executable = vim.fn.stdpath("data") .. "/synapse/synapse",
