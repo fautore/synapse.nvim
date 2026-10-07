@@ -1,13 +1,15 @@
 # synapse.nvim
 
-A Neovim extension that scans the repository containing the current buffer and opens its Markdown notes as an Obsidian-style knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).
+A Neovim extension that scans the repository containing the current buffer and opens its Markdown notes and Obsidian canvases as a knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).
 
-- `[[wiki links]]`, aliases, headings, and Markdown links to `.md` files
+- `.md`, `.markdown`, and Obsidian `.canvas` files
+- canvas file cards and links inside canvas text nodes
+- `[[wiki links]]`, aliases, headings, and Markdown links to notes or canvases
 - animated force-directed layout with center gravity and connection-weighted node sizing
 - unresolved links rendered as dim ghost nodes and connectors
 - antialiased node and connector edges
 - current-buffer node highlighted with the configured accent
-- live in-window graph reload for Markdown changes, including changes made outside Neovim
+- live in-window graph reload for Markdown and canvas changes, including changes made outside Neovim
 - colors inherited from Neovim and updated live on `:colorscheme` changes
 - terminal font detection for Kitty and Ghostty, with Fontconfig fallback
 - smooth hover focus enlarges the node, highlights its neighbors/links, and labels it directly below the node

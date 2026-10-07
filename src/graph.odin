@@ -1,5 +1,6 @@
 package main
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:math"
 import "core:os"
@@ -32,6 +33,14 @@ is_ignored_directory :: proc(name: string) -> bool {
 is_markdown_file_name :: proc(name: string) -> bool {
 	return (len(name) >= 3 && strings.equal_fold(name[len(name)-3:], ".md")) ||
 	       (len(name) >= 9 && strings.equal_fold(name[len(name)-9:], ".markdown"))
+}
+
+is_canvas_file_name :: proc(name: string) -> bool {
+	return len(name) >= 7 && strings.equal_fold(name[len(name)-7:], ".canvas")
+}
+
+is_note_file_name :: proc(name: string) -> bool {
+	return is_markdown_file_name(name) || is_canvas_file_name(name)
 }
 
 normalize_id :: proc(raw: string) -> string {
@@ -92,12 +101,54 @@ extract_links :: proc(content: string) -> [dynamic]string {
 		if end_rel < 0 { break }
 		target := strings.trim_space(content[start:start+end_rel])
 		if !strings.contains(target, "://") && !strings.has_prefix(target, "#") {
-			if strings.has_suffix(strings.to_lower(target), ".md") || strings.contains(target, ".md#") {
+			path := target
+			if fragment := strings.index_byte(path, '#'); fragment >= 0 {path = path[:fragment]}
+			if is_note_file_name(path) {
 				id := normalize_id(target)
 				if len(id) > 0 { append(&result, id) }
 			}
 		}
 		cursor = start + end_rel + 1
+	}
+	return result
+}
+
+Canvas_Node :: struct {
+	file: string,
+	text: string,
+}
+
+Canvas_File :: struct {
+	nodes: []Canvas_Node,
+}
+
+extract_canvas_links :: proc(content: string) -> [dynamic]string {
+	canvas: Canvas_File
+	defer {
+		for node in canvas.nodes {
+			delete(node.file)
+			delete(node.text)
+		}
+		delete(canvas.nodes)
+	}
+	if err := json.unmarshal_string(content, &canvas); err != nil {
+		// Keep links in text nodes useful even while a canvas is temporarily invalid.
+		return extract_links(content)
+	}
+
+	result := make([dynamic]string)
+	for node in canvas.nodes {
+		// File cards are links from the canvas to Markdown notes or other canvases.
+		// Ignore image and other attachment cards, which are not graph nodes.
+		if len(node.file) > 0 && is_note_file_name(node.file) {
+			id := normalize_id(node.file)
+			if len(id) > 0 {append(&result, id)}
+		}
+		if len(node.text) > 0 {
+			text_links := extract_links(node.text)
+			for link in text_links {append(&result, link)}
+			delete(text_links)
+		}
 	}
 	return result
 }
@@ -118,7 +169,7 @@ load_graph :: proc(root: string) -> (Graph, bool) {
 			os.walker_skip_dir(&walker)
 			continue
 		}
-		if info.type != .Regular || !is_markdown_file_name(info.name) { continue }
+		if info.type != .Regular || !is_note_file_name(info.name) { continue }
 
 		data, err := os.read_entire_file(info.fullpath, context.allocator)
 		if err != nil {
@@ -132,12 +183,13 @@ load_graph :: proc(root: string) -> (Graph, bool) {
 		h := hash_string(id)
 		angle := f32(h % 10000) / 10000.0 * 2.0 * math.PI
 		radius := 0.15 + f32((h >> 14) % 1000) / 1000.0 * 0.65
+		links := is_canvas_file_name(info.name) ? extract_canvas_links(content) : extract_links(content)
 		note := Note{
 			path = strings.clone(info.fullpath),
 			id = strings.clone(id),
 			title = note_title(content, info.fullpath),
 			pos = {math.cos(angle) * radius, math.sin(angle) * radius},
-			links = extract_links(content),
+			links = links,
 			exists = true,
 		}
 		append(&graph.notes, note)

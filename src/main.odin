@@ -586,7 +586,7 @@ main :: proc() {
 			glfw.PollEvents()
 		} else {
 			// Cursor, keyboard, resize and close events wake this immediately. The
-			// timeout only exists so external Markdown changes are still detected.
+			// timeout only exists so external note and canvas changes are still detected.
 			glfw.WaitEventsTimeout(0.5)
 		}
 		handle_input()
@@ -1791,11 +1791,11 @@ vault_fingerprint :: proc(root: string) -> u64 {
 			os.walker_skip_dir(&walker)
 			continue
 		}
-		if info.type != .Regular || !is_markdown_file_name(info.name) {continue}
+		if info.type != .Regular || !is_note_file_name(info.name) {continue}
 		modified := u64(time.to_unix_nanoseconds(info.modification_time))
 		file_hash := hash_string(info.fullpath) ~ u64(info.size) ~ modified
 		// Order-independent combination keeps directory enumeration changes from
-		// causing false reloads while still accounting for every Markdown file.
+		// causing false reloads while still accounting for every note and canvas file.
 		fingerprint ~= file_hash + 0x9e3779b97f4a7c15 + (file_hash << 6) + (file_hash >> 2)
 		count += 1
 	}
