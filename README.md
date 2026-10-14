@@ -41,7 +41,7 @@ With `lazy.nvim`:
 
 ```lua
 {
-  "your-name/synapse.nvim",
+  "fautore/synapse.nvim",
   build = "make",
   opts = {},
   cmd = { "Synapse", "SynapseClose", "SynapseBuild" },
