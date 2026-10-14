@@ -83,6 +83,7 @@ require("synapse").setup({
   auto_build = true,
   odin = "odin",
   glslc = "glslc",
+  hide_title_bar = false, -- hide native window decorations
   -- Usually detected from Kitty/Ghostty automatically:
   -- font = "0xProto Nerd Font", -- family name or a .ttf/.otf path
   -- font_size = 14,

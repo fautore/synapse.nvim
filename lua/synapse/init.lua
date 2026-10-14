@@ -10,6 +10,7 @@ local defaults = {
   glslc = "glslc",
   make = "make",
   auto_build = true,
+  hide_title_bar = false,
   font = nil, -- font file or Fontconfig family; nil detects the terminal
   font_size = nil,
   root_markers = { ".obsidian", ".git", ".jj" },
@@ -175,6 +176,9 @@ local function launch(root, current)
   write_theme_file()
   local font_path, font_size = terminal_font()
   local args = { config.executable, "--root", root, "--theme-file", state.theme_file }
+  if config.hide_title_bar then
+    table.insert(args, "--hide-title-bar")
+  end
   if font_path then
     vim.list_extend(args, { "--font", font_path, "--font-size", tostring(font_size) })
   end

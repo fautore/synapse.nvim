@@ -83,6 +83,7 @@ g_muted_color := [4]f32{0.43, 0.48, 0.58, 1.0}
 g_highlight_color := [4]f32{1.0, 0.70, 0.22, 1.0}
 g_font_path: string
 g_font_point_size: f32 = 10
+g_hide_title_bar: bool
 g_font_pixel_height: f32
 g_font_ascent: f32
 g_font_bitmap: []byte
@@ -179,7 +180,8 @@ main :: proc() {
 	context.logger = log.create_console_logger()
 	g_ctx = context
 
-	g_root, g_current, g_theme_file, g_font_path, g_font_point_size = parse_arguments()
+	g_root, g_current, g_theme_file, g_font_path, g_font_point_size, g_hide_title_bar =
+		parse_arguments()
 	load_theme(g_theme_file)
 	ok: bool
 	g_graph, ok = load_graph(g_root)
@@ -202,6 +204,7 @@ main :: proc() {
 
 	glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
 	glfw.WindowHint(glfw.RESIZABLE, glfw.TRUE)
+	glfw.WindowHint(glfw.DECORATED, !g_hide_title_bar)
 
 	title := fmt.aprintf(
 		"Synapse — %d notes · %d links",
@@ -1138,7 +1141,11 @@ record_command_buffer :: proc(command_buffer: vk.CommandBuffer, image_index: u32
 	must(vk.EndCommandBuffer(command_buffer))
 }
 
-parse_arguments :: proc() -> (root, current, theme_file, font_path: string, font_size: f32) {
+parse_arguments :: proc() -> (
+	root, current, theme_file, font_path: string,
+	font_size: f32,
+	hide_title_bar: bool,
+) {
 	font_size = 10
 	root = "."
 	for i := 1; i < len(os.args); i += 1 {
@@ -1157,6 +1164,8 @@ parse_arguments :: proc() -> (root, current, theme_file, font_path: string, font
 				if parsed, parsed_ok := strconv.parse_f32(os.args[i]);
 				   parsed_ok {font_size = parsed}
 			}
+		case "--hide-title-bar":
+			hide_title_bar = true
 		case:
 			// A positional path is convenient when running the renderer by hand.
 			if i == 1 {root = os.args[i]}
