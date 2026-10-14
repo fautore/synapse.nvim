@@ -1,8 +1,15 @@
-<p align="center">
-  <img src="docs/assets/synapse.svg" width="180" alt="Synapse logo">
-</p>
+<div align="center">
 
 # synapse.nvim
+##### Explore your Markdown notes as a native Vulkan knowledge graph.
+
+[![Lua](https://img.shields.io/badge/Lua-blue.svg?style=for-the-badge&logo=lua)](https://www.lua.org)
+[![Neovim](https://img.shields.io/badge/Neovim%200.10+-green.svg?style=for-the-badge&logo=neovim)](https://neovim.io)
+[![Odin](https://img.shields.io/badge/Odin-1E5184.svg?style=for-the-badge)](https://odin-lang.org)
+[![Vulkan](https://img.shields.io/badge/Vulkan-red.svg?style=for-the-badge&logo=vulkan)](https://www.vulkan.org)
+
+<img alt="Synapse logo" height="280" src="/docs/assets/synapse.svg" />
+</div>
 
 A Neovim extension that scans the repository containing the current buffer and opens its Markdown notes and Obsidian canvases as a knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).
 
