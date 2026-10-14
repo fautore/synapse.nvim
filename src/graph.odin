@@ -9,13 +9,19 @@ import "core:strings"
 
 Vec2 :: struct { x, y: f32 }
 
-Note :: struct {
-	path:  string,
+Link :: struct {
 	id:    string,
 	title: string,
-	pos:   Vec2,
-	vel:   Vec2,
-	links: [dynamic]string,
+}
+
+Note :: struct {
+	path:   string,
+	id:     string,
+	title:  string,
+	pos:    Vec2,
+	vel:    Vec2,
+	links:  [dynamic]Link,
+	exists: bool,
 }
 
 Edge :: struct { from, to: int }
@@ -74,8 +80,8 @@ note_title :: proc(content, path: string) -> string {
 	return strings.clone(filepath.stem(filepath.base(path)))
 }
 
-extract_links :: proc(content: string) -> [dynamic]string {
-	result := make([dynamic]string)
+extract_links :: proc(content: string) -> [dynamic]Link {
+	result := make([dynamic]Link)
 
 	// Obsidian wiki links: [[note]], [[note#heading]], [[note|alias]].
 	cursor := 0
@@ -85,8 +91,16 @@ extract_links :: proc(content: string) -> [dynamic]string {
 		start := cursor + start_rel + 2
 		end_rel := strings.index(content[start:], "]]" )
 		if end_rel < 0 { break }
-		id := normalize_id(content[start:start+end_rel])
-		if len(id) > 0 { append(&result, id) }
+		raw := content[start:start+end_rel]
+		id := normalize_id(raw)
+		if len(id) > 0 {
+			// A graph node represents the target file, not this link's alias.
+			title := raw
+			if alias := strings.index_byte(title, '|'); alias >= 0 {title = title[:alias]}
+			if heading := strings.index_byte(title, '#'); heading >= 0 {title = title[:heading]}
+			title = filepath.stem(filepath.base(strings.trim_space(title)))
+			append(&result, Link{id, strings.clone(title)})
+		}
 		cursor = start + end_rel + 2
 	}
 
@@ -95,7 +109,8 @@ extract_links :: proc(content: string) -> [dynamic]string {
 	for cursor < len(content) {
 		open_rel := strings.index(content[cursor:], "](")
 		if open_rel < 0 { break }
-		start := cursor + open_rel + 2
+		close := cursor + open_rel
+		start := close + 2
 		end_rel := strings.index_byte(content[start:], ')')
 		if end_rel < 0 { break }
 		target := strings.trim_space(content[start:start+end_rel])
@@ -104,7 +119,15 @@ extract_links :: proc(content: string) -> [dynamic]string {
 			if fragment := strings.index_byte(path, '#'); fragment >= 0 {path = path[:fragment]}
 			if is_note_file_name(path) {
 				id := normalize_id(target)
-				if len(id) > 0 { append(&result, id) }
+				if len(id) > 0 {
+					label_start := close
+					for label_start > cursor && content[label_start-1] != '[' {label_start -= 1}
+					title := strings.trim_space(content[label_start:close])
+					if len(title) == 0 {
+						title = filepath.stem(filepath.base(strings.trim_space(path)))
+					}
+					append(&result, Link{id, strings.clone(title)})
+				}
 			}
 		}
 		cursor = start + end_rel + 1
@@ -121,7 +144,7 @@ Canvas_File :: struct {
 	nodes: []Canvas_Node,
 }
 
-extract_canvas_links :: proc(content: string) -> [dynamic]string {
+extract_canvas_links :: proc(content: string) -> [dynamic]Link {
 	canvas: Canvas_File
 	defer {
 		for node in canvas.nodes {
@@ -135,13 +158,16 @@ extract_canvas_links :: proc(content: string) -> [dynamic]string {
 		return extract_links(content)
 	}
 
-	result := make([dynamic]string)
+	result := make([dynamic]Link)
 	for node in canvas.nodes {
 		// File cards are links from the canvas to Markdown notes or other canvases.
 		// Ignore image and other attachment cards, which are not graph nodes.
 		if len(node.file) > 0 && is_note_file_name(node.file) {
 			id := normalize_id(node.file)
-			if len(id) > 0 {append(&result, id)}
+			if len(id) > 0 {
+				title := filepath.stem(filepath.base(node.file))
+				append(&result, Link{id, strings.clone(title)})
+			}
 		}
 		if len(node.text) > 0 {
 			text_links := extract_links(node.text)
@@ -189,6 +215,7 @@ load_graph :: proc(root: string) -> (Graph, bool) {
 			title = note_title(content, info.fullpath),
 			pos = {math.cos(angle) * radius, math.sin(angle) * radius},
 			links = links,
+			exists = true,
 		}
 		append(&graph.notes, note)
 		delete(data)
@@ -211,14 +238,27 @@ load_graph :: proc(root: string) -> (Graph, bool) {
 	real_note_count := len(graph.notes)
 	for from in 0..<real_note_count {
 		note := graph.notes[from]
-		for target in note.links {
-			to, found := by_id[target]
+		for link in note.links {
+			to, found := by_id[link.id]
 			if !found {
-				name := filepath.base(target)
+				name := filepath.base(link.id)
 				if !ambiguous[name] { to, found = by_name[name] }
 			}
-			// Obsidian's graph omits links whose target is not present in the vault.
-			if !found || to == from { continue }
+			if !found {
+				// Keep unresolved links visible as placeholder nodes.
+				h := hash_string(link.id)
+				angle := f32(h % 10000) / 10000.0 * 2.0 * math.PI
+				radius := 0.15 + f32((h >> 14) % 1000) / 1000.0 * 0.65
+				to = len(graph.notes)
+				append(&graph.notes, Note{
+					id = strings.clone(link.id),
+					title = strings.clone(link.title),
+					pos = {math.cos(angle) * radius, math.sin(angle) * radius},
+					exists = false,
+				})
+				by_id[graph.notes[to].id] = to
+			}
+			if to == from { continue }
 			a, b := from, to
 			if a > b { a, b = b, a }
 			key := (u64(u32(a)) << 32) | u64(u32(b))
@@ -233,7 +273,10 @@ destroy_graph :: proc(graph: ^Graph) {
 		delete(note.path)
 		delete(note.id)
 		delete(note.title)
-		for link in note.links { delete(link) }
+		for link in note.links {
+			delete(link.id)
+			delete(link.title)
+		}
 		delete(note.links)
 	}
 	delete(graph.notes)

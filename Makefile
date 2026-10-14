@@ -36,6 +36,7 @@ $(OUT): $(ODIN_SOURCES) $(SHADER_BINARIES) target/libfont_bridge.a
 
 check: shaders target/libfont_bridge.a
 	$(ODIN) check src
+	$(ODIN) test src
 
 clean:
 	rm -rf target

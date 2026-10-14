@@ -21,6 +21,7 @@ local defaults = {
     edge = "Comment",
     muted = "NonText",
     current = "DiagnosticWarn",
+    ghost = "LineNr",
   },
 }
 
@@ -112,6 +113,7 @@ local function write_theme_file()
     highlight_color(config.highlight_groups.edge, "fg", normal_fg),
     highlight_color(config.highlight_groups.muted, "fg", normal_fg),
     highlight_color(config.highlight_groups.current, "fg", 0xf9e2af),
+    highlight_color(config.highlight_groups.ghost, "fg", 0x585b70),
   }
   local temporary = state.theme_file .. ".tmp"
   local file = assert(io.open(temporary, "w"))

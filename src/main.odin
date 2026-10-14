@@ -81,6 +81,7 @@ g_node_color := [4]f32{0.30, 0.68, 0.96, 1.0}
 g_edge_color := [4]f32{0.35, 0.48, 0.68, 0.42}
 g_muted_color := [4]f32{0.43, 0.48, 0.58, 1.0}
 g_highlight_color := [4]f32{1.0, 0.70, 0.22, 1.0}
+g_ghost_color := [4]f32{0.20, 0.22, 0.25, 0.82}
 g_font_path: string
 g_font_point_size: f32 = 10
 g_hide_title_bar: bool
@@ -1624,7 +1625,8 @@ build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
 
 	for edge, edge_index in graph.edges {
 		a, b := graph.notes[edge.from].pos, graph.notes[edge.to].pos
-		color := g_edge_color
+		is_ghost := !graph.notes[edge.from].exists || !graph.notes[edge.to].exists
+		color := is_ghost ? with_alpha(g_ghost_color, 0.65) : g_edge_color
 		focus := g_edge_focus[edge_index]
 		color = mix_color(color, with_alpha(g_highlight_color, 0.9), focus)
 		color = with_alpha(color, 1.0 - g_hover_presence * (1.0 - focus) * 0.72)
@@ -1635,7 +1637,11 @@ build_mesh :: proc(graph: ^Graph, current: string) -> [dynamic]Vertex {
 	for note, i in graph.notes {
 		radius := node_radius(g_degrees[i]) * g_node_scales[i]
 		color := g_node_color
-		if g_degrees[i] == 0 {color = g_muted_color}
+		if !note.exists {
+			color = g_ghost_color
+		} else if g_degrees[i] == 0 {
+			color = g_muted_color
+		}
 		if len(current) > 0 && note.id == current {color = g_highlight_color}
 		focus := g_node_focus[i]
 		color = mix_color(color, g_highlight_color, focus)
@@ -1719,13 +1725,14 @@ load_theme :: proc(path: string) -> bool {
 	if len(path) == 0 {return false}
 	data, err := os.read_entire_file(path, context.temp_allocator)
 	if err != nil {return false}
-	colors := [6][4]f32 {
+	colors := [7][4]f32 {
 		g_background,
 		g_text_color,
 		g_node_color,
 		g_edge_color,
 		g_muted_color,
 		g_highlight_color,
+		g_ghost_color,
 	}
 	text := string(data)
 	count := 0
@@ -1733,25 +1740,33 @@ load_theme :: proc(path: string) -> bool {
 		if count >= len(colors) {break}
 		alpha: f32 = 1
 		if count == 3 {alpha = 0.42}
+		if count == 6 {alpha = 0.82}
 		color, ok := parse_hex_color(line, alpha)
 		if !ok {return false}
 		colors[count] = color
 		count += 1
 	}
-	if count != len(colors) {return false}
+	// Accept the six-color format written by an already-running older Lua module.
+	// This matters when auto-build replaces the executable without restarting Neovim.
+	if count < len(colors) - 1 {return false}
+	if count == len(colors) - 1 {
+		colors[6] = with_alpha(colors[4], 0.82)
+	}
 	changed :=
 		colors[0] != g_background ||
 		colors[1] != g_text_color ||
 		colors[2] != g_node_color ||
 		colors[3] != g_edge_color ||
 		colors[4] != g_muted_color ||
-		colors[5] != g_highlight_color
+		colors[5] != g_highlight_color ||
+		colors[6] != g_ghost_color
 	g_background = colors[0]
 	g_text_color = colors[1]
 	g_node_color = colors[2]
 	g_edge_color = colors[3]
 	g_muted_color = colors[4]
 	g_highlight_color = colors[5]
+	g_ghost_color = colors[6]
 	return changed
 }
 

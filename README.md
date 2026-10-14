@@ -6,6 +6,7 @@ A Neovim extension that scans the repository containing the current buffer and o
 - canvas file cards and links inside canvas text nodes
 - `[[wiki links]]`, aliases, headings, and Markdown links to notes or canvases
 - animated force-directed layout with center gravity and connection-weighted node sizing
+- unresolved links rendered as dim ghost nodes and connectors
 - antialiased node and connector edges
 - current-buffer node highlighted with the configured accent
 - live in-window graph reload for Markdown and canvas changes, including changes made outside Neovim
@@ -95,6 +96,7 @@ require("synapse").setup({
     edge = "Comment",            -- links
     muted = "NonText",           -- unlinked notes
     current = "DiagnosticWarn",  -- current-buffer note
+    ghost = "LineNr",            -- unresolved links
   },
   -- root = "/fixed/vault", -- string or function(start_path) -> root
   -- executable = vim.fn.stdpath("data") .. "/synapse/synapse",
