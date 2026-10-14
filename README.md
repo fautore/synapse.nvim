@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/synapse.svg" width="180" alt="Synapse logo">
+</p>
+
 # synapse.nvim
 
 A Neovim extension that scans the repository containing the current buffer and opens its Markdown notes and Obsidian canvases as a knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).

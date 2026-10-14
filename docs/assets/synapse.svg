@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Synapse logo</title>
+
+  <defs>
+    <!-- A 30-degree tilt from vertical, with a clear gap between both halves. -->
+    <clipPath id="left-half">
+      <polygon points="40,48 368,48 128,464 40,464" />
+    </clipPath>
+    <clipPath id="right-half">
+      <polygon points="384,48 472,48 472,464 144,464" />
+    </clipPath>
+  </defs>
+
+  <!-- The text-line outlines continue beneath the clip so the divide has square, clean cuts. -->
+  <g clip-path="url(#left-half)" fill="none" stroke="#b8bb26" stroke-width="14">
+    <rect x="64" y="122" width="300" height="52" rx="26" />
+    <rect x="64" y="230" width="300" height="52" rx="26" />
+    <rect x="64" y="338" width="300" height="52" rx="26" />
+  </g>
+  <g clip-path="url(#left-half)" fill="none" stroke="#928374" stroke-width="6" stroke-linecap="round" opacity="0.9">
+    <path d="M92 141 H330" />
+    <path d="M92 155 H330" />
+    <path d="M92 249 H330" />
+    <path d="M92 263 H330" />
+    <path d="M92 357 H330" />
+    <path d="M92 371 H330" />
+  </g>
+
+  <!-- The mesh is clipped independently, leaving an uncolored vertical divide. -->
+  <g clip-path="url(#right-half)">
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M266 256 L367 146 L402 342 L266 256" stroke="#b8bb26" stroke-width="8" opacity="0.82" />
+      <g stroke="#928374" stroke-width="5" opacity="0.9">
+        <path d="M367 146 L441 92" />
+        <path d="M367 146 L456 218 L402 342" />
+        <path d="M402 342 L452 390" />
+        <path d="M402 342 L432 454" />
+        <path d="M402 342 L250 410" />
+      </g>
+    </g>
+
+    <g fill="#928374">
+      <circle cx="441" cy="92" r="10" />
+      <circle cx="456" cy="218" r="9" />
+      <circle cx="250" cy="410" r="11" />
+      <circle cx="432" cy="454" r="9" />
+      <circle cx="452" cy="390" r="8" />
+    </g>
+
+    <g fill="#b8bb26">
+      <circle cx="266" cy="256" r="27" />
+      <circle cx="367" cy="146" r="25" />
+      <circle cx="402" cy="342" r="25" />
+    </g>
+  </g>
+</svg>
