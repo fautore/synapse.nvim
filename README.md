@@ -135,20 +135,6 @@ Runtime graph behavior is controlled by the constants grouped under
 Only measured kinetic energy and `PHYSICS_SETTLE_TIME_MS` stop the simulation;
 there is no fixed runtime cutoff.
 
-## Development
+# Contributing
 
-Project layout:
-
-```text
-src/                  Odin renderer and graph sources
-src/font_bridge.c     FreeType bridge
-src/shaders/          GLSL shader sources
-target/shaders/       generated SPIR-V shaders
-target/synapse        generated renderer executable
-```
-
-```sh
-make check
-make
-./target/synapse --root /path/to/vault --current relative/note.md
-```
+PR welcome!
