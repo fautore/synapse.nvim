@@ -9,7 +9,6 @@ local defaults = {
   odin = "odin",
   glslc = "glslc",
   make = "make",
-  auto_build = true,
   hide_title_bar = false,
   font = nil, -- font file or Fontconfig family; nil detects the terminal
   font_size = nil,
@@ -42,37 +41,6 @@ end
 
 local function exists(path)
   return uv.fs_stat(path) ~= nil
-end
-
-local function newer_than(path, timestamp)
-  local stat = uv.fs_stat(path)
-  return stat and stat.mtime.sec > timestamp
-end
-
-local function source_tree_is_newer(directory, timestamp)
-  for name, kind in vim.fs.dir(directory) do
-    local path = directory .. "/" .. name
-    if kind == "directory" then
-      if source_tree_is_newer(path, timestamp) then
-        return true
-      end
-    elseif kind == "file" and
-        (name:match("%.odin$") or name:match("%.c$") or name:match("%.vert$") or name:match("%.frag$")) and
-        newer_than(path, timestamp) then
-      return true
-    end
-  end
-  return false
-end
-
-local function needs_build()
-  local binary = uv.fs_stat(config.executable)
-  if not binary then
-    return true
-  end
-  local source_time = binary.mtime.sec
-  return source_tree_is_newer(plugin_root .. "/src", source_time)
-      or newer_than(plugin_root .. "/Makefile", source_time)
 end
 
 local function vault_for_buffer(bufnr)
@@ -269,15 +237,11 @@ function M.open(opts)
   end
   local root, current = vault_for_buffer()
   local start = function() launch(root, current) end
-  if not exists(config.executable) or (config.auto_build and needs_build()) then
-    if not config.auto_build then
-      notify("Renderer is missing; run :SynapseBuild", vim.log.levels.ERROR)
-      return
-    end
-    build(start)
-  else
-    start()
+  if not exists(config.executable) then
+    notify("Renderer is missing; reinstall the plugin or run :SynapseBuild", vim.log.levels.ERROR)
+    return
   end
+  start()
 end
 
 function M.close()

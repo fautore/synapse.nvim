@@ -55,7 +55,7 @@ Or add the repository to `runtimepath` and run:
 make
 ```
 
-The plugin also builds lazily on the first `:Synapse` call if `target/synapse` is absent or older than the sources.
+`lazy.nvim` runs `make` when the plugin is installed or updated, so the renderer is ready before the first `:Synapse` call.
 
 ## Usage
 
@@ -86,7 +86,6 @@ Configuration is optional:
 
 ```lua
 require("synapse").setup({
-  auto_build = true,
   odin = "odin",
   glslc = "glslc",
   hide_title_bar = false, -- hide native window decorations
