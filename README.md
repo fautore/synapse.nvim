@@ -11,25 +11,19 @@
 <img alt="Synapse logo" height="280" src="/docs/assets/synapse.svg" />
 </div>
 
-A Neovim extension that scans the repository containing the current buffer and opens its Markdown notes and Obsidian canvases as a knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).
+Synapse scans the project containing your current buffer and renders its Markdown notes and Obsidian canvases as a knowledge graph in a native **Vulkan** window. The renderer and graph parser are written in [Odin](https://odin-lang.org/).
 
-- `.md`, `.markdown`, and Obsidian `.canvas` files
-- canvas file cards and links inside canvas text nodes
-- `[[wiki links]]`, aliases, headings, and Markdown links to notes or canvases
-- animated force-directed layout with center gravity and connection-weighted node sizing
-- unresolved links rendered as dim ghost nodes and connectors
-- antialiased node and connector edges
-- current-buffer node highlighted with the configured accent
-- live in-window graph reload for Markdown and canvas changes, including changes made outside Neovim
-- colors inherited from Neovim and updated live on `:colorscheme` changes
-- terminal font detection for Kitty and Ghostty, with Fontconfig fallback
-- smooth hover focus enlarges the node, highlights its neighbors/links, and labels it directly below the node
-- mouse dragging pans the view or pins and moves nodes while neighbors respond physically
-- event-driven idle mode stops physics and frame presentation after the graph settles
-- GPU rendering through Vulkan; GLFW is used only for the native window/input
-- repository detection via `.obsidian`, `.git`, or `.jj`
+## Features
 
-> Neovim floating windows cannot host an OS Vulkan surface. `:Synapse` therefore opens a separate native window owned by the Odin process.
+- **Markdown and Canvas support** — indexes `.md`, `.markdown`, and Obsidian `.canvas` files, including canvas file cards and links in text nodes.
+- **Link discovery** — resolves `[[wiki links]]`, aliases, headings, and standard Markdown links to notes or canvases, dead and ghost links are also supported.
+- **Navigation** — explore an animated force-directed graph with zooming, panning, and responsive node dragging.
+- **Highlights** — highlights the current note, hover over a node to highlight it and its neighbors.
+- **Live reload** — reflects Markdown and canvas changes made inside or outside Neovim without reopening the graph.
+- **Neovim-aware theme-ing** — inherits highlight colors from your active colorscheme and updates them on `:colorscheme` changes.
+- **Terminal-aware fonts** — detects Kitty and Ghostty font settings, with Fontconfig as a fallback.
+- **Efficient native rendering** — uses Vulkan for antialiased nodes and edges, then suspends physics and frame presentation once the graph settles to save on your precious CPU and GPU cycles.
+- **Automatic project discovery** — finds roots through `.obsidian`, `.git`, or `.jj` while skipping common generated and metadata directories.
 
 ## Requirements
 
